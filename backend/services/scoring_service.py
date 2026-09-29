@@ -25,6 +25,8 @@ from __future__ import annotations
 import logging
 import math
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Protocol, runtime_checkable
@@ -396,6 +398,65 @@ def _rebind_shap_links(explainers: dict[str, Any]) -> dict[str, Any]:
     return explainers
 
 
+# A UBJSON string is "S", a length (typed integer), then the bytes.
+_RNG_STATE_KEY = b"rng_stateS"
+_UBJ_INTEGER_FORMATS = {b"i": ">b", b"U": ">B", b"I": ">h", b"l": ">i", b"L": ">q"}
+
+
+def _with_native_rng_state(buffer: bytes) -> bytes:
+    """Replace a booster's serialised RNG state with this platform's own.
+
+    xgboost 3 writes the training RNG (a ``std::mt19937``) into each pickled
+    booster the way the C++ standard library prints it, and that text differs
+    by platform: libstdc++ (Linux, where the shipped artefacts were trained)
+    writes decimal words that MSVC's reader (Windows) rejects with
+    ``XGBoostError: input stream corrupted``, so a Windows laptop silently fell
+    back to the surrogate. The RNG only drives training; the trees, base score
+    and every prediction are unchanged by the swap.
+    """
+    import json
+    import struct
+
+    import numpy as np
+    import xgboost as xgb
+
+    start = buffer.find(_RNG_STATE_KEY)
+    if start < 0:
+        return buffer
+    marker_at = start + len(_RNG_STATE_KEY)
+    fmt = _UBJ_INTEGER_FORMATS[buffer[marker_at : marker_at + 1]]
+    width = struct.calcsize(fmt)
+    (length,) = struct.unpack(fmt, buffer[marker_at + 1 : marker_at + 1 + width])
+    end = marker_at + 1 + width + length
+
+    probe = xgb.train({}, xgb.DMatrix(np.zeros((2, 1)), label=[0.0, 1.0]), num_boost_round=1)
+    native = json.loads(probe.save_config())["learner"]["generic_param"]["rng_state"].encode()
+    return buffer[:marker_at] + b"L" + struct.pack(">q", len(native)) + native + buffer[end:]
+
+
+@contextmanager
+def _portable_xgboost_boosters() -> Iterator[None]:
+    """Let boosters pickled on another OS unpickle here; see :func:`_with_native_rng_state`."""
+    from xgboost import core
+
+    original = core.Booster.__setstate__
+
+    def setstate(booster: Any, state: dict[str, Any]) -> None:
+        try:
+            original(booster, dict(state))
+        except core.XGBoostError:
+            if state.get("handle") is None:
+                raise
+            portable = bytearray(_with_native_rng_state(bytes(state["handle"])))
+            original(booster, {**state, "handle": portable})
+
+    core.Booster.__setstate__ = setstate
+    try:
+        yield
+    finally:
+        core.Booster.__setstate__ = original
+
+
 class MLScoringService(ScoringService):
     """Scores applicants with the trained ensemble and real TreeSHAP values.
 
@@ -458,10 +519,13 @@ class MLScoringService(ScoringService):
             load_feature_metadata,
         )
 
+        with _portable_xgboost_boosters():
+            model = joblib.load(MODEL_PATH)
+            shap_bundle = joblib.load(SHAP_EXPLAINER_PATH)
         return cls(
-            model=joblib.load(MODEL_PATH),
+            model=model,
             scaler=joblib.load(SCALER_PATH),
-            shap_bundle=joblib.load(SHAP_EXPLAINER_PATH),
+            shap_bundle=shap_bundle,
             metadata=load_feature_metadata(),
         )
 
