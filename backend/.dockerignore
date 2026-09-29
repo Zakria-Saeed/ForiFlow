@@ -20,6 +20,10 @@ __pycache__/
 venv/
 env/
 
+# Local-run secrets; Compose injects the container's environment from ../.env.
+.env
+.env.*
+
 # Local database: demo data belongs on the /data volume, not in the image.
 *.db
 *.db-journal

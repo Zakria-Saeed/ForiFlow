@@ -10,8 +10,10 @@ export default function LoginPage() {
   const location = useLocation();
   const from = location.state?.from?.pathname ?? "/";
 
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
+  // Optional single-laptop prefill: frontend/.env.local for `npm run dev`, or the
+  // FORIFLOW_LOGIN_PREFILL_* build args in Docker. Unset in normal builds.
+  const [username, setUsername] = useState(import.meta.env.VITE_LOGIN_PREFILL_USERNAME ?? "");
+  const [password, setPassword] = useState(import.meta.env.VITE_LOGIN_PREFILL_PASSWORD ?? "");
   const [error, setError] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
 

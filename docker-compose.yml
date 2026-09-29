@@ -74,6 +74,9 @@ services:
   frontend:
     build:
       context: ./frontend
+      args:
+        VITE_LOGIN_PREFILL_USERNAME: ${FORIFLOW_LOGIN_PREFILL_USERNAME:-}
+        VITE_LOGIN_PREFILL_PASSWORD: ${FORIFLOW_LOGIN_PREFILL_PASSWORD:-}
     image: foriflow-frontend:1.3.0
     container_name: foriflow-frontend
     restart: unless-stopped

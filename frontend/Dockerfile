@@ -12,6 +12,9 @@ COPY package.json package-lock.json ./
 RUN npm ci
 
 COPY . .
+# Optional sign-in prefill for a single-laptop demo; empty unless .env sets it.
+ARG VITE_LOGIN_PREFILL_USERNAME=""
+ARG VITE_LOGIN_PREFILL_PASSWORD=""
 RUN npm run build
 
 FROM nginx:1.27-alpine AS runtime

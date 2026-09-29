@@ -6,6 +6,25 @@ All notable changes to ForiFlow are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Optional sign-in prefill for a single-laptop demo: `VITE_LOGIN_PREFILL_*` in
+  `frontend/.env.local` for `npm run dev`, or `FORIFLOW_LOGIN_PREFILL_*` in
+  `.env` for the Docker build. Empty unless set.
+- `start-local.bat`: runs the backend (SQLite) and the Vite dashboard without
+  Docker and opens the dashboard in the browser.
+
+### Fixed
+
+- The trained ensemble now loads on Windows. xgboost 3 stores the training
+  RNG in each pickled booster in the C++ library's own text format, and MSVC
+  cannot read the libstdc++ format of the Linux-trained artefacts
+  (`XGBoostError: input stream corrupted`), so Windows silently served the
+  linear surrogate. The loader swaps in this platform's RNG state, which only
+  training uses; trees and predictions are unchanged.
+- `backend/.dockerignore` excludes `.env` files so local secrets never enter
+  the image.
+
 ## [1.3.0] - 2026-09-29
 
 ### Added
