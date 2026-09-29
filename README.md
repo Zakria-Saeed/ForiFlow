@@ -149,7 +149,7 @@ foriflow/
 
 ## 👤 Author
 
-**Ramzan Idreesi**||**Zakria Saeed Abbasi** — AI Software Engineer | Full-Stack Developer
+**Ramzan Idreesi & Zakria Saeed Abbasi** | AI Software Engineers & Full-Stack Developers
 
 [GitHub](https://github.com/Idreesi8) · [LinkedIn](https://www.linkedin.com/in/ramzan-idreesi-0b0245328)
 
