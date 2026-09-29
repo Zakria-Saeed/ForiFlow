@@ -34,10 +34,14 @@ def _booster_with_unreadable_rng_state() -> tuple[object, dict, object]:
 
 
 def test_unreadable_rng_state_breaks_a_plain_load() -> None:
-    """Guard the premise: without the shim the booster does not load."""
+    """Guard the premise where it holds: MSVC rejects the state, libstdc++
+    leaves the stream in a failed state without raising, so Linux loads it."""
     _, state, _ = _booster_with_unreadable_rng_state()
-    with pytest.raises(xgb.core.XGBoostError):
-        xgb.Booster().__setstate__(state)
+    try:
+        xgb.Booster().__setstate__(dict(state))
+    except xgb.core.XGBoostError:
+        return
+    pytest.skip("this platform's C++ library does not reject an unreadable RNG state")
 
 
 def test_portable_load_restores_identical_predictions() -> None:
