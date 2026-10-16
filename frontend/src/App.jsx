@@ -1,13 +1,24 @@
 import { useCallback, useEffect, useState } from "react";
 import { Navigate, NavLink, Outlet, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 
-import { API_BASE_LABEL, fetchHealth } from "./api/client.js";
-import { clearSession, getStoredRole, getStoredUsername, isLoggedIn } from "./api/auth.js";
+import { API_BASE_LABEL, fetchHealth, fetchMe, logout } from "./api/client.js";
+import {
+  clearSession,
+  getStoredRole,
+  getStoredUsername,
+  isLoggedIn,
+  updateStoredAccount,
+} from "./api/auth.js";
 import AlertsPage from "./pages/AlertsPage.jsx";
 import ApplicationsPage from "./pages/ApplicationsPage.jsx";
 import DashboardPage from "./pages/DashboardPage.jsx";
 import LoginPage from "./pages/LoginPage.jsx";
+import MemoPage from "./pages/MemoPage.jsx";
+import ModelPage from "./pages/ModelPage.jsx";
 import NotFoundPage from "./pages/NotFoundPage.jsx";
+import RemindersPage from "./pages/RemindersPage.jsx";
+import PolicyPage from "./pages/PolicyPage.jsx";
+import TeamPage from "./pages/TeamPage.jsx";
 import ScoringPage from "./pages/ScoringPage.jsx";
 import ShapReportsPage from "./pages/ShapReportsPage.jsx";
 
@@ -16,12 +27,16 @@ const NAV_ITEMS = [
   { to: "/scoring", label: "Credit Scoring", icon: GaugeIcon },
   { to: "/shap", label: "SHAP Reports", icon: ChartIcon },
   { to: "/alerts", label: "EWS Alerts", icon: BellIcon },
+  { to: "/reminders", label: "Reminders", icon: MessageIcon },
   { to: "/applications", label: "Applications", icon: ListIcon },
+  { to: "/model", label: "Model Performance", icon: CurveIcon },
+  { to: "/policy", label: "Credit Policy", icon: ListIcon },
+  { to: "/team", label: "Team & Roles", icon: UsersIcon },
 ];
 
 /**
  * Application shell: persistent sidebar navigation, a status header and the
- * five routed workspaces used by credit officers.
+ * nine routed workspaces used by credit officers.
  */
 export default function App() {
   return (
@@ -40,6 +55,11 @@ export default function App() {
         <Route path="/shap/:applicationId" element={<ShapReportsPage />} />
         <Route path="/alerts" element={<AlertsPage />} />
         <Route path="/applications" element={<ApplicationsPage />} />
+        <Route path="/memo/:applicationId" element={<MemoPage />} />
+        <Route path="/model" element={<ModelPage />} />
+        <Route path="/reminders" element={<RemindersPage />} />
+        <Route path="/policy" element={<PolicyPage />} />
+        <Route path="/team" element={<TeamPage />} />
         <Route path="*" element={<NotFoundPage />} />
       </Route>
     </Routes>
@@ -56,10 +76,40 @@ function RequireAuth({ children }) {
 
 function OfficerShell() {
   const navigate = useNavigate();
-  const username = getStoredUsername();
-  const role = getStoredRole();
+  const [account, setAccount] = useState({
+    username: getStoredUsername(),
+    role: getStoredRole(),
+  });
+  const { username, role } = account;
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [health, setHealth] = useState({ state: "checking", detail: null });
+
+  // The stored role is only a display hint; ask the server who this is. A
+  // disabled or signed-out account gets a 401 here and the client sends it
+  // back to the sign-in page.
+  useEffect(() => {
+    let cancelled = false;
+    fetchMe()
+      .then((me) => {
+        if (cancelled) return;
+        updateStoredAccount(me);
+        setAccount({ username: me.username, role: me.role });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const signOut = useCallback(async () => {
+    try {
+      await logout();
+    } catch {
+      // Already expired or the API is down: the local session goes regardless.
+    }
+    clearSession();
+    navigate("/login", { replace: true });
+  }, [navigate]);
 
   const checkHealth = useCallback(async () => {
     try {
@@ -88,7 +138,7 @@ function OfficerShell() {
       ) : null}
 
       <aside
-        className={`fixed inset-y-0 left-0 z-30 flex w-64 flex-col bg-brand-900 text-brand-50 transition-transform lg:static lg:translate-x-0 ${
+        className={`fixed inset-y-0 left-0 z-30 flex w-64 flex-col bg-brand-900 text-brand-50 transition-transform lg:static lg:translate-x-0 print:hidden ${
           isSidebarOpen ? "translate-x-0" : "-translate-x-full"
         }`}
       >
@@ -133,7 +183,7 @@ function OfficerShell() {
       </aside>
 
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="sticky top-0 z-10 border-b border-slate-200 bg-white/90 backdrop-blur">
+        <header className="sticky top-0 z-10 border-b border-slate-200 bg-white/90 backdrop-blur print:hidden">
           <div className="flex items-center justify-between gap-4 px-5 py-3.5">
             <div className="flex items-center gap-3">
               <button
@@ -165,10 +215,7 @@ function OfficerShell() {
               <button
                 type="button"
                 className="btn-secondary px-3 py-1.5 text-xs"
-                onClick={() => {
-                  clearSession();
-                  navigate("/login", { replace: true });
-                }}
+                onClick={signOut}
               >
                 Sign out
               </button>
@@ -180,8 +227,8 @@ function OfficerShell() {
           <Outlet />
         </main>
 
-        <footer className="border-t border-slate-200 bg-white px-5 py-3 text-xs text-slate-500">
-          ForiFlow v1.3 · API {API_BASE_LABEL} · All amounts in PKR
+        <footer className="border-t border-slate-200 bg-white px-5 py-3 text-xs text-slate-500 print:hidden">
+          ForiFlow v2.3 · API {API_BASE_LABEL} · All amounts in PKR
         </footer>
       </div>
     </div>
@@ -243,6 +290,34 @@ function BellIcon({ className }) {
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
       <path d="M6 9a6 6 0 1112 0c0 4 1.5 5.5 1.5 5.5h-15S6 13 6 9z" strokeLinejoin="round" />
       <path d="M10 18a2 2 0 004 0" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function CurveIcon({ className }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
+      <path d="M4 4v16h16" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M4 20c2-9 6-13 16-15" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function MessageIcon({ className }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
+      <path d="M4 5h16v11H9l-5 4V5z" strokeLinejoin="round" />
+      <path d="M8 9h8M8 12h5" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function UsersIcon({ className }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
+      <circle cx="9" cy="8" r="3.2" />
+      <path d="M3 19c0-3 2.7-5 6-5s6 2 6 5" strokeLinecap="round" />
+      <path d="M16 5.2a3 3 0 010 5.6M17.5 14.3c2 .6 3.5 2.2 3.5 4.7" strokeLinecap="round" />
     </svg>
   );
 }

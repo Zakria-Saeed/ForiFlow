@@ -1,11 +1,16 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
-import { getStoredRole } from "../api/auth.js";
+import { canDecideCredit } from "../api/auth.js";
 import { apiErrorMessage, fetchApplications } from "../api/client.js";
-import { bandForDecision, finalDecisionOf, isPendingReview } from "../lib/decisions.js";
+import {
+  bandForDecision,
+  decisionStatusOf,
+  finalDecisionOf,
+  isPendingReview,
+} from "../lib/decisions.js";
 import { formatDateTime, formatPKRCompact, parseApiDate } from "../lib/format.js";
-import { DecisionBadge, FinalDecisionBadge } from "./common/Badges.jsx";
+import { FinalDecisionBadge, RecommendationBadge } from "./common/Badges.jsx";
 import { EmptyState, ErrorState, LoadingState } from "./common/States.jsx";
 
 const COLUMNS = [
@@ -15,17 +20,17 @@ const COLUMNS = [
   { key: "loan_amount_pkr", label: "Facility", type: "number", align: "right" },
   { key: "tenure_months", label: "Tenure", type: "number", align: "right" },
   { key: "risk_score", label: "Score", type: "number", align: "right" },
-  { key: "decision", label: "Model", type: "string", align: "left" },
-  { key: "final", label: "Final decision", type: "string", align: "left" },
+  { key: "decision", label: "Recommendation", type: "string", align: "left" },
+  { key: "final", label: "Officer decision", type: "string", align: "left" },
   { key: "created_at", label: "Assessed", type: "date", align: "left" },
 ];
 
-// Approved / Rejected filter on the decision that stands (the officer's call
-// for a reviewed Manual Review case); the Model column still shows the band.
-const DECISION_FILTERS = ["All", "Pending review", "Approved", "Rejected"];
+// Filters on the officer's decision; the Recommendation column shows what the
+// policy recommended, which is never a decision.
+const DECISION_FILTERS = ["All", "Pending decision", "Approved", "Rejected"];
 
 function sortValue(application, key) {
-  return key === "final" ? (finalDecisionOf(application) ?? "Pending review") : application[key];
+  return key === "final" ? decisionStatusOf(application) : application[key];
 }
 
 function compareValues(a, b, column) {
@@ -50,7 +55,7 @@ export default function ApplicationTable({
   refreshToken = 0,
 }) {
   const navigate = useNavigate();
-  const canDecide = getStoredRole() === "admin";
+  const canDecide = canDecideCredit();
   const [applications, setApplications] = useState(providedApplications ?? []);
   const [isLoading, setIsLoading] = useState(!providedApplications);
   const [error, setError] = useState(null);
@@ -85,7 +90,7 @@ export default function ApplicationTable({
 
     return applications
       .filter((application) => {
-        if (decisionFilter === "Pending review" && !isPendingReview(application)) {
+        if (decisionFilter === "Pending decision" && !isPendingReview(application)) {
           return false;
         }
         if (
@@ -253,7 +258,7 @@ export default function ApplicationTable({
                       </span>
                     </td>
                     <td className="px-5 py-3 whitespace-nowrap">
-                      <DecisionBadge decision={application.decision} />
+                      <RecommendationBadge decision={application.decision} />
                     </td>
                     <td className="px-5 py-3 whitespace-nowrap">
                       <FinalDecisionBadge application={application} />

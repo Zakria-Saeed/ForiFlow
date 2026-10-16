@@ -14,10 +14,30 @@ export function getStoredRole() {
   return window.localStorage.getItem(ROLE_KEY) ?? "";
 }
 
+/** Managers and admins decide applications and resolve alerts. */
+export function canDecideCredit() {
+  return ["admin", "manager"].includes(getStoredRole());
+}
+
+/** Only admins manage officer accounts. */
+export function canManageTeam() {
+  return getStoredRole() === "admin";
+}
+
 export function storeSession({ access_token, username, role }) {
   window.localStorage.setItem(TOKEN_KEY, access_token);
   window.localStorage.setItem(USER_KEY, username ?? "");
   window.localStorage.setItem(ROLE_KEY, role ?? "");
+}
+
+/**
+ * Refresh the stored name and role from GET /auth/me. The server re-reads the
+ * role on every request anyway; this only keeps the menus honest after an
+ * admin changes it.
+ */
+export function updateStoredAccount({ username, role }) {
+  if (username) window.localStorage.setItem(USER_KEY, username);
+  if (role) window.localStorage.setItem(ROLE_KEY, role);
 }
 
 export function clearSession() {

@@ -52,6 +52,14 @@ MODEL_PATH = ML_DIR / "foriflow_model.pkl"
 SCALER_PATH = ML_DIR / "scaler.pkl"
 SHAP_EXPLAINER_PATH = ML_DIR / "shap_explainer.pkl"
 FEATURE_NAMES_PATH = ML_DIR / "feature_names.json"
+# Written by ml.evaluate_model; optional at serving time.
+EVALUATION_PATH = ML_DIR / "model_evaluation.json"
+# Written by ml.ews_markov; optional at serving time.
+EWS_TRANSITION_PATH = ML_DIR / "ews_transition.json"
+# Written by ml.compare_models.
+COMPARISON_PATH = ML_DIR / "model_comparison.json"
+# Written by ml.fairness_audit.
+FAIRNESS_PATH = ML_DIR / "fairness_audit.json"
 
 # Full set of features this module knows how to build. The subset actually used
 # by the trained model is recorded in ``feature_names.json``, because the winning
@@ -191,6 +199,38 @@ def snap_payment_history(score: float, levels: tuple[float, float]) -> float:
 def load_feature_metadata() -> dict:
     """Read the served feature order and their learned clip bounds."""
     with FEATURE_NAMES_PATH.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def load_model_evaluation() -> dict | None:
+    """Read the hold-out evaluation and calibrator, if ``ml.evaluate_model`` has run."""
+    if not EVALUATION_PATH.exists():
+        return None
+    with EVALUATION_PATH.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def load_fairness_audit() -> dict | None:
+    """Read the group audit, if ``ml.fairness_audit`` has run."""
+    if not FAIRNESS_PATH.exists():
+        return None
+    with FAIRNESS_PATH.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def load_model_comparison() -> dict | None:
+    """Read the alternatives comparison, if ``ml.compare_models`` has run."""
+    if not COMPARISON_PATH.exists():
+        return None
+    with COMPARISON_PATH.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def load_ews_transition() -> dict | None:
+    """Read the fitted early-warning chain, if ``ml.ews_markov`` has run."""
+    if not EWS_TRANSITION_PATH.exists():
+        return None
+    with EWS_TRANSITION_PATH.open("r", encoding="utf-8") as handle:
         return json.load(handle)
 
 

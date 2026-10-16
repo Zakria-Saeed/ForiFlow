@@ -10,11 +10,17 @@ Docker (legacy volume still mounted at /data)::
 
 Aborts if the SQLite schema does not match the expected column set, if a
 type cannot be copied without coercion, or if Postgres already has rows.
+
+A file from before borrowers existed (migration 0006) has no borrower for its
+applications. Each one is given its own borrower as it is copied, by the same
+rule the migration uses: created in application-id order from the application's
+own details, never merged on a name.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -83,14 +89,133 @@ EXPECTED_0003: dict[str, tuple[str, ...]] = {
     "alerts": (*EXPECTED["alerts"], "assigned_to", "resolved_by", "resolution_note"),
 }
 
+# After migration 0004 (business sector, amount paid per monitored month).
+_APP3 = EXPECTED_0003["applications"]
+EXPECTED_0004: dict[str, tuple[str, ...]] = {
+    "applications": (
+        *_APP3[: _APP3.index("scored_by")],
+        "business_sector",
+        *_APP3[_APP3.index("scored_by") :],
+    ),
+    "alerts": EXPECTED_0003["alerts"],
+    "ews_tracking": (*EXPECTED["ews_tracking"], "amount_paid_pkr"),
+}
+
+# After migration 0005 (turnover evidence and a contact number).
+_APP4 = EXPECTED_0004["applications"]
+EXPECTED_0005: dict[str, tuple[str, ...]] = {
+    **EXPECTED_0004,
+    "applications": (
+        *_APP4[: _APP4.index("scored_by")],
+        "turnover_evidence_json",
+        "contact_phone",
+        *_APP4[_APP4.index("scored_by") :],
+    ),
+}
+
+# After migration 0006 (borrower link and the model that scored each application).
+_APP5 = EXPECTED_0005["applications"]
+EXPECTED_0006: dict[str, tuple[str, ...]] = {
+    **EXPECTED_0005,
+    "applications": (
+        "id",
+        "borrower_id",
+        *_APP5[1 : _APP5.index("business_sector")],
+        "model_version",
+        "scoring_engine",
+        "model_version_id",
+        *_APP5[_APP5.index("business_sector") :],
+    ),
+}
+
+# After migration 0007 (model assessment, policy recommendation, human decision).
+_APP6 = EXPECTED_0006["applications"]
+_NEW_0007 = (
+    "raw_pd",
+    "calibrated_pd",
+    "risk_band",
+    "policy_id",
+    "policy_version",
+    "policy_evaluation",
+    "reason_codes",
+    "decision_status",
+    "decision_source",
+    "escalated_by",
+    "escalated_at",
+    "escalation_note",
+    "supersedes_application_id",
+    "superseded_by_application_id",
+)
+EXPECTED_0007: dict[str, tuple[str, ...]] = {
+    **EXPECTED_0006,
+    "applications": (
+        *_APP6[: _APP6.index("business_sector")],
+        *_NEW_0007,
+        *_APP6[_APP6.index("business_sector") :],
+    ),
+}
+
+# Migration 0008: EWS history, score provenance and the alert lifecycle.
+EXPECTED_0008: dict[str, tuple[str, ...]] = {
+    **EXPECTED_0007,
+    "alerts": (
+        *EXPECTED_0003["alerts"],
+        "severity",
+        "reason_codes",
+        "evidence",
+        "previous_score",
+        "recommended_actions",
+        "observation_id",
+        "last_observation_id",
+        "acknowledged_at",
+        "acknowledged_by",
+        "assigned_at",
+        "assigned_by",
+        "action_due_date",
+        "action_note",
+    ),
+    "ews_tracking": (
+        *EXPECTED_0004["ews_tracking"],
+        "observation_date",
+        "days_late",
+        "score_source",
+        "override_reason",
+        "rule_score",
+        "record_status",
+        "supersedes_observation_id",
+        "superseded_by_observation_id",
+        "correction_reason",
+        "assessment",
+        "created_by",
+        "created_at",
+        "request_id",
+    ),
+}
+
+# Pre-2.1 alert statuses and their 2.1 names (as migration 0008 renames them).
+ALERT_STATUS_RENAMES = {"Active": "Open", "In Review": "Acknowledged"}
+
 # SQLite declared types we will copy without rewriting values.
 _INT = {"INT", "INTEGER", "BIGINT"}
 _FLOAT = {"REAL", "FLOAT", "DOUBLE", "DOUBLE PRECISION", "NUMERIC", "DECIMAL"}
 _TEXT = {"TEXT", "VARCHAR", "NVARCHAR", "CHAR", "CLOB", "STRING"}
 _TIME = {"DATETIME", "TIMESTAMP", "DATE"}
-_COMPATIBLE = _INT | _FLOAT | _TEXT | _TIME
+_JSON = {"JSON"}
+_BOOL = {"BOOLEAN"}
+_COMPATIBLE = _INT | _FLOAT | _TEXT | _TIME | _JSON | _BOOL
 
-TABLE_ORDER = ("applications", "alerts", "ews_tracking")
+# Parents before children, so every foreign key finds its row.
+TABLE_ORDER = (
+    "users",
+    "borrowers",
+    "model_versions",
+    "credit_policies",
+    "applications",
+    # Since 0008 an alert points at the observations it rests on.
+    "ews_tracking",
+    "alerts",
+    "audit_logs",
+)
 
 # Present on SQLite after Step 2 create_all; absent on a pre-auth file.
 OPTIONAL: dict[str, tuple[str, ...]] = {
@@ -101,7 +226,88 @@ OPTIONAL: dict[str, tuple[str, ...]] = {
         "role",
         "created_at",
     ),
+    # Present from migration 0006.
+    "borrowers": (
+        "id",
+        "public_id",
+        "business_name",
+        "owner_name",
+        "identifier_type",
+        "identifier",
+        "contact_phone",
+        "business_sector",
+        "years_in_operation",
+        "status",
+        "created_at",
+        "updated_at",
+    ),
+    "model_versions": (
+        "id",
+        "version",
+        "engine",
+        "artifact_sha256",
+        "training_dataset",
+        "feature_set",
+        "feature_set_version",
+        "trained_at",
+        "metrics",
+        "status",
+        "fallback_reason",
+        "registered_at",
+    ),
+    # Present from migration 0007.
+    "credit_policies": (
+        "id",
+        "version",
+        "name",
+        "description",
+        "status",
+        "decline_max_score",
+        "manual_review_max_score",
+        "manager_approval_limit_pkr",
+        "decline_override_admin_only",
+        "created_at",
+        "created_by",
+        "activated_at",
+        "activated_by",
+        "retired_at",
+    ),
+    "audit_logs": (
+        "id",
+        "occurred_at",
+        "user_id",
+        "username",
+        "role",
+        "action",
+        "entity_type",
+        "entity_id",
+        "previous_state",
+        "new_state",
+        "details",
+        "ip_address",
+        "request_id",
+    ),
 }
+
+
+# Migration 0009 adds model provenance; an older file's model_versions lacks it.
+OPTIONAL_0009: dict[str, tuple[str, ...]] = {
+    "model_versions": (
+        *OPTIONAL["model_versions"][: OPTIONAL["model_versions"].index("metrics") + 1],
+        "provenance",
+        *OPTIONAL["model_versions"][OPTIONAL["model_versions"].index("metrics") + 1 :],
+    ),
+}
+
+
+# Migration 0010 adds the account status column.
+OPTIONAL_0010: dict[str, tuple[str, ...]] = {
+    "users": (*OPTIONAL["users"], "is_active"),
+}
+
+# 0010 security state: sign-in counters and signed-out token ids. Short-lived
+# by design and meaningless on another server, so never copied.
+TRANSIENT_TABLES = frozenset({"login_attempts", "revoked_tokens"})
 
 
 class MigrationError(RuntimeError):
@@ -134,7 +340,9 @@ def assert_schema(connection: sqlite3.Connection) -> dict[str, tuple[str, ...]]:
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         )
     }
-    extra = existing_tables - set(EXPECTED) - set(OPTIONAL) - {"alembic_version"}
+    extra = (
+        existing_tables - set(EXPECTED) - set(OPTIONAL) - TRANSIENT_TABLES - {"alembic_version"}
+    )
     if extra:
         raise MigrationError(
             f"SQLite has unexpected tables {sorted(extra)}. Refusing to copy."
@@ -154,7 +362,17 @@ def assert_schema(connection: sqlite3.Connection) -> dict[str, tuple[str, ...]]:
     for table, expected in tables_to_check.items():
         cols = sqlite_columns(connection, table)
         names = tuple(name for name, _type in cols)
-        if names not in (expected, EXPECTED_0003.get(table)):
+        if names not in (
+            expected,
+            EXPECTED_0003.get(table),
+            EXPECTED_0004.get(table),
+            EXPECTED_0005.get(table),
+            EXPECTED_0006.get(table),
+            EXPECTED_0007.get(table),
+            EXPECTED_0008.get(table),
+            OPTIONAL_0009.get(table),
+            OPTIONAL_0010.get(table),
+        ):
             raise MigrationError(
                 f"Table {table!r} columns {names} do not match expected {expected}."
             )
@@ -166,6 +384,110 @@ def assert_schema(connection: sqlite3.Connection) -> dict[str, tuple[str, ...]]:
                 )
         matched[table] = names
     return matched
+
+
+def _stored_model_version(explanation_json: str | None) -> str | None:
+    """The version string inside a stored explanation, if it can be read."""
+    if not explanation_json:
+        return None
+    try:
+        value = json.loads(explanation_json).get("model_version")
+    except (ValueError, AttributeError):
+        return None
+    return value[:120] if isinstance(value, str) and value else None
+
+
+def _engine_of(model_version: str | None) -> str | None:
+    """Read the scoring engine off a version string, or None if unclear."""
+    if not model_version:
+        return None
+    if model_version.startswith("ensemble-"):
+        return "ml"
+    if model_version.startswith("surrogate-"):
+        return "surrogate"
+    return None
+
+
+_BAND_OF = {"Rejected": "High Risk", "Manual Review": "Medium Risk", "Approved": "Low Risk"}
+
+
+def _with_legacy_decision(row: dict) -> dict:
+    """Give a pre-2.0 application the decision status its record already implied.
+
+    Mirrors migration 0007. Before 2.0 an Approved or Rejected band was final
+    by itself, so those rows are marked decided with source ``legacy_auto``: no
+    officer is invented for them. A Manual Review row keeps the officer's
+    decision if one was recorded and is Pending otherwise.
+    """
+    band, review = row["decision"], row.get("review_decision")
+    if band == "Manual Review":
+        status, source = (review, "officer") if review else ("Pending", None)
+    else:
+        status, source = band, "legacy_auto"
+    return {
+        **row,
+        "decision_status": status,
+        "decision_source": source,
+        "risk_band": _BAND_OF.get(band),
+    }
+
+
+def _with_legacy_observation(row: dict) -> dict:
+    """A pre-2.1 month: provenance unknown, and the only (active) row of its month.
+
+    Mirrors migration 0008. Nothing else is filled in: date, days late, author
+    and request were never recorded.
+    """
+    return {**row, "score_source": "legacy_unknown", "record_status": "active"}
+
+
+def _with_renamed_status(row: dict) -> dict:
+    """A pre-2.1 alert under its 2.1 status. In Review keeps who took it."""
+    status = row["alert_status"]
+    renamed = {**row, "alert_status": ALERT_STATUS_RENAMES.get(status, status)}
+    if status == "In Review" and row.get("assigned_to"):
+        renamed["acknowledged_by"] = row["assigned_to"]
+    return renamed
+
+
+def _with_new_borrowers(connection, applications: list[dict]) -> list[dict]:
+    """Open one borrower per legacy application and return the linked rows.
+
+    Mirrors the backfill in migration 0006: in application-id order, from the
+    application's own details, never merged on a name.
+    """
+    linked: list[dict] = []
+    for row in applications:
+        borrower_id = connection.execute(
+            text(
+                "INSERT INTO borrowers (business_name, owner_name, contact_phone, "
+                "business_sector, years_in_operation, status, created_at, updated_at) "
+                "VALUES (:business_name, :owner_name, :contact_phone, :business_sector, "
+                ":years_in_operation, 'active', :created_at, :created_at) RETURNING id"
+            ),
+            {
+                "business_name": row["business_name"],
+                "owner_name": row["applicant_name"],
+                "contact_phone": row.get("contact_phone"),
+                "business_sector": row.get("business_sector"),
+                "years_in_operation": row["years_in_operation"],
+                "created_at": row["created_at"],
+            },
+        ).scalar_one()
+        connection.execute(
+            text("UPDATE borrowers SET public_id = :public_id WHERE id = :id"),
+            {"public_id": f"BRW-{borrower_id:06d}", "id": borrower_id},
+        )
+        version = _stored_model_version(row.get("shap_explanation_json"))
+        linked.append(
+            {
+                **row,
+                "borrower_id": borrower_id,
+                "model_version": version,
+                "scoring_engine": _engine_of(version),
+            }
+        )
+    return linked
 
 
 def migrate(sqlite_path: Path, postgres_url: str) -> dict[str, int]:
@@ -180,12 +502,32 @@ def migrate(sqlite_path: Path, postgres_url: str) -> dict[str, int]:
     sqlite_conn.row_factory = sqlite3.Row
     try:
         copy_tables = assert_schema(sqlite_conn)
-        table_order = tuple(copy_tables)
+        table_order = tuple(table for table in TABLE_ORDER if table in copy_tables)
+        # A file from before migration 0006: its applications have no borrower.
+        needs_borrowers = "borrower_id" not in copy_tables["applications"]
+        # A file from before migration 0007: no recorded decision status.
+        needs_decision_status = "decision_status" not in copy_tables["applications"]
+        # A file from before migration 0008: no observation provenance or lifecycle.
+        needs_ews_history = (
+            "ews_tracking" in copy_tables and "record_status" not in copy_tables["ews_tracking"]
+        )
+        if needs_borrowers and "borrowers" in copy_tables:
+            raise MigrationError(
+                "SQLite has a borrowers table but applications without borrower_id."
+            )
 
         pg = create_engine(postgres_url, future=True)
         with pg.connect() as probe:
-            for table in table_order:
-                count = probe.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar_one()
+            must_be_empty = (*table_order, "borrowers") if needs_borrowers else table_order
+            for table in dict.fromkeys(must_be_empty):
+                # Applying the migrations to an empty database writes their own
+                # audit entries and the demo policy; those are expected.
+                clause = ""
+                if table == "audit_logs":
+                    clause = " WHERE username <> 'system'"
+                elif table == "credit_policies":
+                    clause = " WHERE created_by <> 'system'"
+                count = probe.execute(text(f"SELECT COUNT(*) FROM {table}{clause}")).scalar_one()
                 if count:
                     raise MigrationError(
                         f"Postgres table {table!r} already has {count} row(s). "
@@ -197,17 +539,74 @@ def migrate(sqlite_path: Path, postgres_url: str) -> dict[str, int]:
             for table in table_order:
                 columns = copy_tables[table]
                 col_sql = ", ".join(columns)
-                placeholders = ", ".join(f":{name}" for name in columns)
-                rows = sqlite_conn.execute(f"SELECT {col_sql} FROM {table}").fetchall()
+                rows = [
+                    dict(zip(columns, row, strict=True))
+                    for row in sqlite_conn.execute(
+                        f"SELECT {col_sql} FROM {table} ORDER BY id"
+                    ).fetchall()
+                ]
+                if table == "audit_logs":
+                    # Its ids would collide with the migration's own entry, and
+                    # an audit id means nothing outside its own database.
+                    columns = tuple(name for name in columns if name != "id")
+                    rows = [{name: row[name] for name in columns} for row in rows]
+                if table == "applications" and needs_borrowers:
+                    columns = (*columns, "borrower_id", "model_version", "scoring_engine")
+                    rows = _with_new_borrowers(connection, rows)
+                    copied["borrowers"] = len(rows)
+                if table == "applications" and needs_decision_status:
+                    columns = (*columns, "decision_status", "decision_source", "risk_band")
+                    rows = [_with_legacy_decision(row) for row in rows]
+                if table == "ews_tracking" and needs_ews_history:
+                    columns = (*columns, "score_source", "record_status")
+                    rows = [_with_legacy_observation(row) for row in rows]
+                if table == "alerts" and needs_ews_history:
+                    columns = (*columns, "acknowledged_by")
+                    rows = [_with_renamed_status(row) for row in rows]
+                link_column = {
+                    "applications": "superseded_by_application_id",
+                    "ews_tracking": "superseded_by_observation_id",
+                }.get(table)
+                links = []
+                if link_column is not None:
+                    # A row can point at a later one (superseded_by), so the
+                    # links are filled in after every row exists.
+                    links = [
+                        (row["id"], row.get(link_column))
+                        for row in rows
+                        if row.get(link_column) is not None
+                    ]
+                    rows = [
+                        {**row, link_column: None} if link_column in row else row
+                        for row in rows
+                    ]
+                if table == "credit_policies":
+                    # The source's policies replace the demo one seeded by the
+                    # migration; no application in this empty database uses it.
+                    connection.execute(text("DELETE FROM credit_policies"))
+                    rows = [
+                        {**row, "decline_override_admin_only": bool(row["decline_override_admin_only"])}
+                        for row in rows
+                    ]
+                if table == "users" and "is_active" in columns:
+                    # SQLite stores booleans as 0/1; PostgreSQL wants a boolean.
+                    rows = [{**row, "is_active": bool(row["is_active"])} for row in rows]
                 if rows:
-                    insert = text(
-                        f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders})"
-                    )
+                    placeholders = ", ".join(f":{name}" for name in columns)
                     connection.execute(
-                        insert, [dict(zip(columns, row, strict=True)) for row in rows]
+                        text(
+                            f"INSERT INTO {table} ({', '.join(columns)}) "
+                            f"VALUES ({placeholders})"
+                        ),
+                        rows,
                     )
                 copied[table] = len(rows)
-            for table in table_order:
+                for row_id, later_id in links:
+                    connection.execute(
+                        text(f"UPDATE {table} SET {link_column} = :later WHERE id = :id"),
+                        {"later": later_id, "id": row_id},
+                    )
+            for table in dict.fromkeys((*table_order, *(("borrowers",) if needs_borrowers else ()))):
                 connection.execute(
                     text(
                         f"SELECT setval(pg_get_serial_sequence('{table}', 'id'), "

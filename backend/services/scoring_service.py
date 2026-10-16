@@ -22,16 +22,30 @@ override the choice; ``ml`` fails loudly if the artefacts cannot be loaded.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from collections.abc import Callable
 from functools import lru_cache
+from types import SimpleNamespace
 from typing import Any, Protocol, runtime_checkable
 
-from schemas import Decision, ExplanationResponse, RiskBand, ShapFeatureContribution
+from schemas import (
+    RECOMMENDATION_OF,
+    ApprovalPath,
+    ApprovalStep,
+    Decision,
+    ExplanationResponse,
+    RiskBand,
+    ShapFeatureContribution,
+)
+from services import policy_rules
+from services.policy_rules import DEMO_BANDS, ScoreBands
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +70,9 @@ class SMEApplicantLike(Protocol):
     years_in_operation: float
     num_employees: int
 
-# Weights sum to 1.0. Ordering reflects the relative importance agreed with the
-# credit policy team for thin-file Pakistani SMEs.
+# Weights sum to 1.0. They are our own judgement of relative importance, set by
+# hand for the fallback engine; they were not fitted to data or agreed with a
+# bank. The trained ensemble (MLScoringService) does not use them.
 FEATURE_WEIGHTS: dict[str, float] = {
     "payment_history_score": 0.22,
     "loan_affordability": 0.18,
@@ -80,22 +95,31 @@ FEATURE_LABELS: dict[str, str] = {
     "num_employees": "Business size (employees)",
 }
 
-# Normalisation bounds, calibrated on the SME reference portfolio. Monthly
-# digital receipts below the floor carry no signal for a formal facility.
+# Normalisation bounds for the fallback engine, chosen by hand (there is no SME
+# reference portfolio behind them). Monthly digital receipts below the floor
+# are treated as carrying no signal for a formal facility.
 DIGITAL_PAYMENTS_FLOOR_PKR: float = 50_000.0
 DIGITAL_PAYMENTS_CAP_PKR: float = 5_000_000.0
 INVENTORY_TURNOVER_CAP: float = 12.0
 YEARS_IN_OPERATION_CAP: float = 10.0
 EMPLOYEES_CAP: int = 50
 
-# Decision policy: 0-40 Rejected, 41-70 Manual Review, 71-100 Approved.
-REJECT_UPPER_BOUND: float = 40.0
-MANUAL_REVIEW_UPPER_BOUND: float = 70.0
+# The score cut-offs are policy, not model, and live in services.policy_rules.
+# These two names are kept only so existing imports keep working; they are the
+# demo policy's defaults, and nothing in this module decides with them.
+REJECT_UPPER_BOUND: float = DEMO_BANDS.decline_max_score
+MANUAL_REVIEW_UPPER_BOUND: float = DEMO_BANDS.manual_review_max_score
 
 # A neutral applicant sits at the midpoint of every normalised feature, which
 # makes the SHAP base value exactly 50 points.
 NEUTRAL_NORMALISED_VALUE: float = 0.5
 BASE_VALUE: float = 50.0
+
+# How a recommendation is worded. The stored value ("Approved") reads like an
+# outcome; a recommendation must not.
+RECOMMENDATION_LABELS: dict[Decision, str] = {
+    decision: recommendation.value for decision, recommendation in RECOMMENDATION_OF.items()
+}
 
 COMPLIANCE_NOTE: str = (
     "SHAP values are stored on-premise so a bank can support an SBP-oriented "
@@ -131,14 +155,22 @@ class ScoreResult:
     The trailing fields are only populated by :class:`MLScoringService`: the
     surrogate has no probability estimate and derives its contributions on
     demand instead of caching them.
+
+    ``decision`` and ``risk_band`` are not model output. They are how the
+    policy bands passed to :meth:`ScoringService.score` read the score
+    (``services.policy_rules``), carried here so the explanation can name them.
+    ``decision`` is a recommendation; an officer makes the decision.
     """
 
     risk_score: float
     decision: Decision
     risk_band: RiskBand
+    bands: ScoreBands = DEMO_BANDS
     normalised_features: dict[str, float] = field(default_factory=dict)
     raw_features: dict[str, float] = field(default_factory=dict)
     probability_of_default: float | None = None
+    # Probability of default after isotonic calibration (ml.evaluate_model).
+    calibrated_pd: float | None = None
     confidence: float | None = None
     contributions: dict[str, float] | None = None
 
@@ -151,6 +183,30 @@ class ScoringService:
     """
 
     model_version: str = "surrogate-linear-v1"
+    # 'surrogate': this hand-weighted formula. The subclass says 'ml'.
+    engine: str = "surrogate"
+    # Why this engine is serving instead of the trained ensemble, set by
+    # get_scoring_service: 'pinned', 'artifacts_missing' or 'load_failed'.
+    fallback_reason: str | None = None
+
+    @property
+    def artifact_sha256(self) -> str:
+        """Fingerprint of what produces this engine's numbers.
+
+        The surrogate has no files, so its identity is its weights and bounds.
+        """
+        payload = {
+            "weights": self.weights,
+            "base_value": self.base_value,
+            "bounds": [
+                DIGITAL_PAYMENTS_FLOOR_PKR,
+                DIGITAL_PAYMENTS_CAP_PKR,
+                INVENTORY_TURNOVER_CAP,
+                YEARS_IN_OPERATION_CAP,
+                EMPLOYEES_CAP,
+            ],
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
     def __init__(
         self,
@@ -207,27 +263,20 @@ class ScoringService:
         }
 
     @staticmethod
-    def decision_for(risk_score: float) -> Decision:
-        """Apply the ForiFlow decision policy to a score."""
-        if risk_score <= REJECT_UPPER_BOUND:
-            return Decision.REJECTED
-        if risk_score <= MANUAL_REVIEW_UPPER_BOUND:
-            return Decision.MANUAL_REVIEW
-        return Decision.APPROVED
+    def decision_for(risk_score: float, bands: ScoreBands = DEMO_BANDS) -> Decision:
+        """The policy recommendation for a score (see ``services.policy_rules``)."""
+        return policy_rules.recommendation_for(risk_score, bands)
 
     @staticmethod
-    def risk_band_for(risk_score: float) -> RiskBand:
-        """Map a score onto its reporting risk band."""
-        if risk_score <= REJECT_UPPER_BOUND:
-            return RiskBand.HIGH
-        if risk_score <= MANUAL_REVIEW_UPPER_BOUND:
-            return RiskBand.MEDIUM
-        return RiskBand.LOW
+    def risk_band_for(risk_score: float, bands: ScoreBands = DEMO_BANDS) -> RiskBand:
+        """The risk band for a score (see ``services.policy_rules``)."""
+        return policy_rules.risk_band_for(risk_score, bands)
 
-    def score(self, applicant: SMEApplicantLike) -> ScoreResult:
-        """Score an applicant and derive its decision band.
+    def score(self, applicant: SMEApplicantLike, bands: ScoreBands = DEMO_BANDS) -> ScoreResult:
+        """Score an applicant; label the score with the given policy bands.
 
-        Returns a score in ``[0, 100]`` where higher is more creditworthy.
+        Returns a score in ``[0, 100]`` where higher is more creditworthy. The
+        score does not depend on ``bands``; only the band label does.
         """
         normalised = self.normalise_features(applicant)
         weighted_sum = sum(
@@ -239,8 +288,9 @@ class ScoringService:
 
         return ScoreResult(
             risk_score=risk_score,
-            decision=self.decision_for(risk_score),
-            risk_band=self.risk_band_for(risk_score),
+            decision=self.decision_for(risk_score, bands),
+            risk_band=self.risk_band_for(risk_score, bands),
+            bands=bands,
             normalised_features=normalised,
             raw_features=self._raw_feature_values(applicant),
         )
@@ -306,8 +356,9 @@ class ScoringService:
         strengths = [c for c in contributions if c.contribution > 0][:3]
 
         sentences = [
-            f"Score {result.risk_score:.1f}/100 ({result.risk_band.value}) "
-            f"resulted in a '{result.decision.value}' outcome."
+            f"Score {result.risk_score:.1f}/100 ({result.risk_band.value}). "
+            f"Policy recommendation: {RECOMMENDATION_LABELS[result.decision]}. "
+            "The final decision is made by an authorised credit officer."
         ]
         if strengths:
             sentences.append(
@@ -322,18 +373,32 @@ class ScoringService:
                 + "."
             )
         if result.decision is Decision.MANUAL_REVIEW:
-            sentences.append(
-                "Referred to a credit officer for manual verification of cash flow evidence."
-            )
+            sentences.append("Cash flow evidence should be verified before deciding.")
         return " ".join(sentences)
 
 
+    def approval_path(
+        self, applicant: SMEApplicantLike, result: ScoreResult
+    ) -> ApprovalPath | None:
+        """Routes to a better band. Only the monotone trained ensemble has them."""
+        return None
+
     def build_explanation(
-        self, result: ScoreResult, application_id: int, business_name: str
+        self,
+        result: ScoreResult,
+        application_id: int,
+        business_name: str,
+        applicant: SMEApplicantLike | None = None,
+        policy_version: str | None = None,
     ) -> ExplanationResponse:
         """Assemble the full explanation payload for a scored application."""
+        from services.reason_codes import reason_codes_for
+
         contributions = self.explain(result)
         return ExplanationResponse(
+            recommendation=RECOMMENDATION_OF[result.decision],
+            policy_version=policy_version,
+            reason_codes=reason_codes_for(contributions),
             application_id=application_id,
             business_name=business_name,
             risk_score=result.risk_score,
@@ -350,6 +415,10 @@ class ScoringService:
             narrative=self.narrative(result, contributions),
             compliance_note=self.compliance_note,
             model_version=self.model_version,
+            probability_of_default=result.calibrated_pd,
+            approval_path=(
+                self.approval_path(applicant, result) if applicant is not None else None
+            ),
         )
 
 
@@ -368,12 +437,38 @@ INTAKE_TO_ML_FEATURE: dict[str, str | None] = {
     "num_employees": None,
 }
 
+# Path-to-approval search: three passes of this many grid points bracket the
+# crossing point to well under PKR 1,000 for any facility the form accepts.
+APPROVAL_SEARCH_POINTS: int = 257
+APPROVAL_SEARCH_PASSES: int = 3
+APPROVAL_ROUNDING_PKR: float = 1_000.0
+
 # Confidence blends how far the score sits from a decision boundary with how
 # closely the two ensemble members agree.
 CONFIDENCE_AGREEMENT_WEIGHT: float = 0.6
 CONFIDENCE_MARGIN_WEIGHT: float = 0.4
 CONFIDENCE_MARGIN_SPAN: float = 30.0
 CONFIDENCE_DISAGREEMENT_SPAN: float = 0.5
+
+# Probability-space SHAP must reproduce each member's prediction to this.
+SHAP_ADDITIVITY_TOLERANCE: float = 1e-6
+
+
+def artifact_fingerprint(paths: Any) -> str:
+    """SHA-256 over the artefact files, in the given order.
+
+    JSON metadata is hashed with LF line endings: a Windows checkout turns
+    ``feature_names.json`` into CRLF, and the same model must get the same
+    fingerprint on every machine. Binary files are hashed byte for byte.
+    """
+    digest = hashlib.sha256()
+    for path in paths:
+        data = path.read_bytes()
+        if path.suffix == ".json":
+            data = data.replace(b"\r\n", b"\n")
+        digest.update(path.name.encode("utf-8"))
+        digest.update(data)
+    return digest.hexdigest()
 
 
 def _rebind_shap_links(explainers: dict[str, Any]) -> dict[str, Any]:
@@ -470,6 +565,20 @@ class MLScoringService(ScoringService):
     creditworthiness ranking on a 0-100 scale, not an absolute default
     probability. That is also what keeps the base value near 50 and the policy
     bands meaningful.
+
+    The absolute probability is reported separately and is display only: a
+    calibrator chosen and fitted on the validation split (``metadata
+    ["calibration"]`` since 2.2; ``ml.evaluate_model`` before) maps the raw
+    probability onto the default rate of the public training file. It is
+    monotone, so it never reorders applicants, and the score, the bands and the
+    SHAP values stay on the raw model.
+
+    The SHAP base value is the *model reference baseline*: the ensemble's
+    expected score over a small reference sample of the SMOTE-balanced training
+    rows. It is not the average of a bank portfolio or of the public file.
+
+    This is a demonstration model trained on public consumer credit data. It is
+    not validated for Pakistani SME lending and must not decide credit alone.
     """
 
     def __init__(
@@ -478,9 +587,12 @@ class MLScoringService(ScoringService):
         scaler: Any,
         shap_bundle: dict[str, Any],
         metadata: dict[str, Any],
+        evaluation: dict[str, Any] | None = None,
+        artifact_sha256: str | None = None,
     ) -> None:
-        """Wire up a loaded model, scaler and SHAP bundle."""
+        """Wire up a loaded model, scaler, SHAP bundle and optional calibrator."""
         super().__init__()
+        self._artifact_sha256 = artifact_sha256
         self.model = model
         self.scaler = scaler
         self.metadata = metadata
@@ -489,6 +601,13 @@ class MLScoringService(ScoringService):
         from ml.features import payment_history_levels
 
         self.history_levels = payment_history_levels(metadata)
+        self.evaluation = (
+            evaluation
+            if evaluation and evaluation.get("model_trained_at") == metadata.get("trained_at")
+            else None
+        )
+        self.calibration = self._calibration_breakpoints(evaluation)
+        self.monotone: dict[str, int] = metadata.get("monotone_constraints", {})
         self.explainers: dict[str, Any] = _rebind_shap_links(shap_bundle["explainers"])
         self.shap_weights: dict[str, float] = shap_bundle["weights"]
         self.output_space: str = shap_bundle.get("output_space", "probability")
@@ -500,6 +619,21 @@ class MLScoringService(ScoringService):
             f"{metadata.get('trained_at', 'undated')}"
         )
         self.compliance_note = self._compliance_note()
+
+    engine: str = "ml"
+
+    @property
+    def artifact_sha256(self) -> str:
+        """SHA-256 over the artefact files this service was loaded from.
+
+        When the service was built from objects in memory rather than from the
+        files, the fingerprint is of the metadata alone and says so.
+        """
+        if self._artifact_sha256 is not None:
+            return self._artifact_sha256
+        digest = hashlib.sha256(b"in-memory:")
+        digest.update(json.dumps(self.metadata, sort_keys=True, default=str).encode("utf-8"))
+        return digest.hexdigest()
 
     # -- loading ----------------------------------------------------------
 
@@ -513,10 +647,12 @@ class MLScoringService(ScoringService):
         import joblib
 
         from ml.features import (
+            FEATURE_NAMES_PATH,
             MODEL_PATH,
             SCALER_PATH,
             SHAP_EXPLAINER_PATH,
             load_feature_metadata,
+            load_model_evaluation,
         )
 
         with _portable_xgboost_boosters():
@@ -527,7 +663,54 @@ class MLScoringService(ScoringService):
             scaler=joblib.load(SCALER_PATH),
             shap_bundle=shap_bundle,
             metadata=load_feature_metadata(),
+            evaluation=load_model_evaluation(),
+            artifact_sha256=artifact_fingerprint(
+                (MODEL_PATH, SCALER_PATH, SHAP_EXPLAINER_PATH, FEATURE_NAMES_PATH)
+            ),
         )
+
+    def _calibration_breakpoints(
+        self, evaluation: dict[str, Any] | None
+    ) -> tuple[list[float], list[float]] | None:
+        """Calibrator breakpoints, or ``None`` when none belongs to this model.
+
+        Since 2.2 the calibrator is saved with the model (``metadata
+        ["calibration"]``), fitted on the validation split. Older artefacts kept
+        it in ``model_evaluation.json``, which is used only when its timestamp
+        matches the served artefact.
+        """
+        own = self.metadata.get("calibration") or {}
+        raw = own.get("raw_probability") or []
+        calibrated = own.get("calibrated_probability") or []
+        if len(raw) >= 2 and len(raw) == len(calibrated):
+            return list(raw), list(calibrated)
+        if not evaluation:
+            return None
+        if evaluation.get("model_trained_at") != self.metadata.get("trained_at"):
+            logger.warning(
+                "model_evaluation.json belongs to another training run; "
+                "calibrated PD is disabled until ml.evaluate_model is re-run."
+            )
+            return None
+        calibrator = evaluation.get("calibrator", {})
+        raw = calibrator.get("raw_probability") or []
+        calibrated = calibrator.get("calibrated_probability") or []
+        if len(raw) < 2 or len(raw) != len(calibrated):
+            return None
+        return list(raw), list(calibrated)
+
+    def calibrated_pd(self, probability_of_default: float) -> float | None:
+        """Map the raw ensemble probability to a calibrated probability of default.
+
+        Linear interpolation between the isotonic breakpoints, clipped at both
+        ends, which is exactly what ``IsotonicRegression.predict`` does.
+        """
+        if self.calibration is None:
+            return None
+        import numpy as np
+
+        raw, calibrated = self.calibration
+        return round(float(np.interp(probability_of_default, raw, calibrated)), 4)
 
     def _tune_for_single_row_inference(self) -> None:
         """Force serial prediction on the loaded members.
@@ -541,7 +724,12 @@ class MLScoringService(ScoringService):
                 estimator.n_jobs = 1
 
     def _expected_score(self) -> float:
-        """Score of an average training applicant, used as the SHAP base value."""
+        """The SHAP base value: the model reference baseline, in score points.
+
+        The ensemble's expected raw probability over the SHAP reference sample
+        (SMOTE-balanced training rows, so near a 50% default prior), turned into a
+        score. It is a reference point for the attributions, not a portfolio average.
+        """
         from ml.shap_utils import expected_positive_value
 
         if self.output_space != "probability":
@@ -566,25 +754,39 @@ class MLScoringService(ScoringService):
         # Read from the artefact's own metadata so the published figures can
         # never drift from the model actually being served.
         cv = self.metadata.get("cross_validation", {})
+        final_test = ((self.evaluation or {}).get("final_test") or {}).get("raw") or {}
         holdout = self.metadata.get("holdout", {})
-        metrics = (
-            f"5-fold CV {cv['auc_roc_mean']:.4f} ± {cv['auc_roc_std']:.4f}, "
-            f"hold-out {holdout['auc']:.4f} "
-            if "auc_roc_mean" in cv and "auc" in holdout
-            else ""
-        )
+        if "auc_roc_mean" in cv and "auc_roc" in final_test:
+            metrics = (
+                f"5-fold CV on the training split {cv['auc_roc_mean']:.4f} ± "
+                f"{cv['auc_roc_std']:.4f}, final test {final_test['auc_roc']:.4f} "
+            )
+        elif "auc_roc_mean" in cv and "auc" in holdout:
+            metrics = f"5-fold CV {cv['auc_roc_mean']:.4f} ± {cv['auc_roc_std']:.4f}, hold-out {holdout['auc']:.4f} "
+        else:
+            metrics = ""
         note = (
             f"{COMPLIANCE_NOTE} Scored by the trained XGBoost + RandomForest "
             f"ensemble ({self.metadata.get('dataset', 'unknown')} dataset, "
             f"{metrics}(n={int(self.metadata.get('rows', 0)):,}, "
             f"{len(self.feature_names)} features, trained on a public/proxy "
-            "dataset — not a real SME portfolio) with TreeSHAP attributions."
+            "dataset — not a real SME portfolio) with TreeSHAP attributions. "
+            "This is a demonstration model trained on public consumer credit data; "
+            "it is not validated for Pakistani SME lending and must not be used for "
+            "autonomous credit decisions."
         )
         if self.history_levels is not None:
             midpoint = sum(self.history_levels) / 2.0
             note += (
                 f" Payment history is read as a clean (above {midpoint:g}) or "
                 f"adverse ({midpoint:g} and below) record, not as a fine scale."
+            )
+        if self.calibration is not None:
+            note += (
+                " The probability of default shown is calibrated (display only) to the "
+                f"{float(self.metadata.get('default_rate', 0.0)):.1%} default rate of "
+                "that public file, not to a Pakistani SME portfolio; the score and SHAP "
+                "use the raw model probability."
             )
         if unused:
             note += (
@@ -611,7 +813,7 @@ class MLScoringService(ScoringService):
         vector = np.array([[clipped[name] for name in self.feature_names]], dtype=float)
         return self.scaler.transform(vector), clipped, raw
 
-    def score(self, applicant: SMEApplicantLike) -> ScoreResult:
+    def score(self, applicant: SMEApplicantLike, bands: ScoreBands = DEMO_BANDS) -> ScoreResult:
         """Score an applicant with the trained ensemble.
 
         Returns a score in ``[0, 100]`` where higher is more creditworthy, along
@@ -623,16 +825,18 @@ class MLScoringService(ScoringService):
         member_pds = self._member_probabilities(scaled)
         probability_of_default = self._ensemble_probability(member_pds)
         risk_score = round(clamp(100.0 * (1.0 - probability_of_default), 0.0, 100.0), 2)
-        contributions = self._shap_contributions(scaled, risk_score)
+        contributions = self._shap_contributions(scaled, risk_score, member_pds)
 
         return ScoreResult(
             risk_score=risk_score,
-            decision=self.decision_for(risk_score),
-            risk_band=self.risk_band_for(risk_score),
+            decision=self.decision_for(risk_score, bands),
+            risk_band=self.risk_band_for(risk_score, bands),
+            bands=bands,
             normalised_features=clipped,
             raw_features={name: round(value, 4) for name, value in raw.items()},
             probability_of_default=round(probability_of_default, 6),
-            confidence=self._confidence(member_pds, risk_score),
+            calibrated_pd=self.calibrated_pd(probability_of_default),
+            confidence=self._confidence(member_pds, risk_score, bands),
             contributions=contributions,
         )
 
@@ -658,7 +862,36 @@ class MLScoringService(ScoringService):
             for name, probability in member_pds.items()
         ) / total_weight
 
-    def _shap_contributions(self, scaled, risk_score: float) -> dict[str, float]:
+    def _member_shap(self, name: str, explainer: Any, scaled, target: float | None):
+        """One member's attributions, verified to add up to its own prediction.
+
+        An input lying exactly on a split threshold (for example 0.5 years, the
+        midpoint between whole years in the training data) is sent left by
+        scikit-learn (``<=``) but can be sent right by the TreeSHAP kernel, so
+        the attributions would explain a neighbouring leaf. When the check fails,
+        the input is moved by one float32 step either way, which the model scores
+        identically, and the version whose attributions add up is used.
+        """
+        import numpy as np
+
+        from ml.shap_utils import expected_positive_value, positive_class_shap
+
+        base = expected_positive_value(explainer) if target is not None else None
+        values = np.asarray(positive_class_shap(explainer.shap_values(scaled))[0], dtype=float)
+        if target is None or abs(base + values.sum() - target) <= SHAP_ADDITIVITY_TOLERANCE:
+            return values
+        point = np.asarray(scaled, dtype=np.float32)
+        for direction in (-np.inf, np.inf):
+            nudged = np.nextafter(point, np.float32(direction)).astype(np.float64)
+            candidate = np.asarray(positive_class_shap(explainer.shap_values(nudged))[0], dtype=float)
+            if abs(base + candidate.sum() - target) <= SHAP_ADDITIVITY_TOLERANCE:
+                return candidate
+        logger.warning("SHAP attributions of %s do not add up to its prediction.", name)
+        return values
+
+    def _shap_contributions(
+        self, scaled, risk_score: float, member_pds: dict[str, float] | None = None
+    ) -> dict[str, float]:
         """Attribute the score to each feature, in score points.
 
         Shapley values are additive across a weighted average of models, so
@@ -668,12 +901,15 @@ class MLScoringService(ScoringService):
         """
         import numpy as np
 
-        from ml.shap_utils import positive_class_shap
-
         total = np.zeros(len(self.feature_names))
         for name, explainer in self.explainers.items():
-            values = positive_class_shap(explainer.shap_values(scaled))[0]
-            total += self.shap_weights[name] * np.asarray(values, dtype=float)
+            target = (
+                member_pds.get(name)
+                if member_pds is not None and self.output_space == "probability"
+                else None
+            )
+            values = self._member_shap(name, explainer, scaled, target)
+            total += self.shap_weights[name] * values
 
         if self.output_space == "probability":
             points = -100.0 * total
@@ -702,7 +938,9 @@ class MLScoringService(ScoringService):
             return np.zeros_like(signed)
         return signed * (gap / total)
 
-    def _confidence(self, member_pds: dict[str, float], risk_score: float) -> float:
+    def _confidence(
+        self, member_pds: dict[str, float], risk_score: float, bands: ScoreBands = DEMO_BANDS
+    ) -> float:
         """Heuristic 0-100 confidence in the decision.
 
         Combines agreement between the two ensemble members with the score's
@@ -714,8 +952,8 @@ class MLScoringService(ScoringService):
         agreement = clamp(1.0 - disagreement / CONFIDENCE_DISAGREEMENT_SPAN)
 
         distance = min(
-            abs(risk_score - REJECT_UPPER_BOUND),
-            abs(risk_score - MANUAL_REVIEW_UPPER_BOUND),
+            abs(risk_score - bands.decline_max_score),
+            abs(risk_score - bands.manual_review_max_score),
         )
         margin = clamp(distance / CONFIDENCE_MARGIN_SPAN)
 
@@ -723,6 +961,203 @@ class MLScoringService(ScoringService):
             CONFIDENCE_AGREEMENT_WEIGHT * agreement + CONFIDENCE_MARGIN_WEIGHT * margin
         )
         return round(confidence * 100.0, 1)
+
+    # -- path to approval -------------------------------------------------
+
+    def _scores_for(self, applicants: list[SMEApplicantLike]) -> list[float]:
+        """Score many what-if applicants in one model pass, without SHAP."""
+        if not applicants:
+            return []  # every search has already ended; nothing left to score
+        import numpy as np
+
+        from ml.features import apply_clips, build_raw_features, snap_payment_history
+
+        rows = []
+        for applicant in applicants:
+            raw = build_raw_features(applicant)
+            clipped = apply_clips(raw, self.feature_clips)
+            if self.history_levels is not None and "payment_history_score" in clipped:
+                clipped["payment_history_score"] = snap_payment_history(
+                    raw["payment_history_score"], self.history_levels
+                )
+            rows.append([clipped[name] for name in self.feature_names])
+        scaled = self.scaler.transform(np.array(rows, dtype=float))
+
+        total_weight = sum(self.shap_weights[name] for name in self.member_names)
+        probability = sum(
+            self.shap_weights[name] * estimator.predict_proba(scaled)[:, 1]
+            for name, estimator in zip(self.member_names, self.model.estimators_, strict=True)
+        ) / total_weight
+        return [
+            round(clamp(100.0 * (1.0 - float(value)), 0.0, 100.0), 2)
+            for value in probability
+        ]
+
+    def _thresholds(
+        self, searches: list[tuple[Callable[[float], SMEApplicantLike], float, float, float]]
+    ) -> list[tuple[float, float] | None]:
+        """For each search, the value closest to ``worse`` that clears its floor.
+
+        A search is ``(make, worse, better, floor_score)``: ``make`` builds the
+        what-if applicant for a value, and the score can only stay level or
+        improve from ``worse`` towards ``better`` (monotone constraints). Grid
+        passes bracket the single crossing point, then the result is snapped to
+        PKR 1,000 on the safe side and re-scored. Every pass scores all searches
+        in one model call, which keeps the whole search to a few predictions.
+        """
+        import numpy as np
+
+        brackets: list[tuple[float, float] | None] = [
+            (worse, better) for _, worse, better, _ in searches
+        ]
+        for _ in range(APPROVAL_SEARCH_PASSES):
+            grids = [
+                np.linspace(bracket[0], bracket[1], APPROVAL_SEARCH_POINTS)
+                if bracket is not None
+                else None
+                for bracket in brackets
+            ]
+            scores = iter(
+                self._scores_for(
+                    [
+                        make(float(value))
+                        for (make, *_), grid in zip(searches, grids, strict=True)
+                        if grid is not None
+                        for value in grid
+                    ]
+                )
+            )
+            for index, ((_, _, _, floor_score), grid) in enumerate(
+                zip(searches, grids, strict=True)
+            ):
+                if grid is None:
+                    continue
+                row = [next(scores) for _ in grid]
+                first = next((i for i, score in enumerate(row) if score > floor_score), None)
+                if first is None:
+                    brackets[index] = None
+                elif first == 0:
+                    brackets[index] = (float(grid[0]), float(grid[0]))
+                else:
+                    brackets[index] = (float(grid[first - 1]), float(grid[first]))
+
+        # Snap away from the failing side: down for a loan, up for turnover.
+        step = APPROVAL_ROUNDING_PKR
+        candidates: list[list[float]] = []
+        for (_, worse, better, _), bracket in zip(searches, brackets, strict=True):
+            if bracket is None:
+                candidates.append([])
+            elif better < worse:
+                snapped = math.floor(bracket[1] / step) * step
+                candidates.append([v for v in (snapped, snapped - step) if v > 0])
+            else:
+                snapped = math.ceil(bracket[1] / step) * step
+                candidates.append([snapped, snapped + step])
+        scores = iter(
+            self._scores_for(
+                [
+                    make(value)
+                    for (make, *_), values in zip(searches, candidates, strict=True)
+                    for value in values
+                ]
+            )
+            if any(candidates)
+            else []
+        )
+        results: list[tuple[float, float] | None] = []
+        for (_, _, _, floor_score), values in zip(searches, candidates, strict=True):
+            scored = [(value, next(scores)) for value in values]
+            results.append(
+                next(((value, score) for value, score in scored if score > floor_score), None)
+            )
+        return results
+
+    def approval_path(
+        self, applicant: SMEApplicantLike, result: ScoreResult
+    ) -> ApprovalPath | None:
+        """Facility size and turnover at which this applicant reaches the next bands."""
+        from ml.features import monthly_turnover_proxy
+
+        if result.decision is Decision.APPROVED:
+            return None
+        if self.monotone.get("loan_to_income") != 1:
+            return None  # without the constraint the crossing point is not unique
+
+        loan = float(applicant.loan_amount_pkr)
+        turnover = monthly_turnover_proxy(applicant)
+        base = {
+            name: getattr(applicant, name)
+            for name in (
+                "tenure_months",
+                "monthly_digital_payments",
+                "payment_history_score",
+                "existing_debt_pkr",
+                "cash_flow_proxy",
+                "years_in_operation",
+            )
+        }
+
+        def with_loan(value: float) -> SMEApplicantLike:
+            return SimpleNamespace(**base, loan_amount_pkr=value)
+
+        def with_turnover(value: float) -> SMEApplicantLike:
+            return SimpleNamespace(
+                **{**base, "monthly_digital_payments": value}, loan_amount_pkr=loan
+            )
+
+        # Below the lowest ratio seen in training the model cannot tell loans
+        # apart, so that ratio bounds both searches.
+        lowest_ratio = float(self.feature_clips.get("loan_to_income", [0.02])[0]) or 0.02
+        smallest_loan = min(loan, lowest_ratio * turnover * 12.0)
+        largest_turnover = max(turnover, loan / (lowest_ratio * 12.0))
+
+        targets = [(Decision.APPROVED, result.bands.manual_review_max_score)]
+        if result.decision is Decision.REJECTED:
+            targets.insert(0, (Decision.MANUAL_REVIEW, result.bands.decline_max_score))
+
+        searches = []
+        for _, floor_score in targets:
+            if turnover > 0:
+                searches.append((with_loan, loan, smallest_loan, floor_score))
+            searches.append((with_turnover, turnover, largest_turnover, floor_score))
+        found = iter(self._thresholds(searches))
+
+        steps = []
+        for decision, _ in targets:
+            by_loan = next(found) if turnover > 0 else None
+            by_turnover = next(found)
+            steps.append(
+                ApprovalStep(
+                    target_decision=decision,
+                    max_loan_pkr=by_loan[0] if by_loan else None,
+                    score_at_max_loan=by_loan[1] if by_loan else None,
+                    required_monthly_turnover_pkr=by_turnover[0] if by_turnover else None,
+                    score_at_turnover=by_turnover[1] if by_turnover else None,
+                )
+            )
+
+        from ml.features import FEATURE_LABELS as ML_FEATURE_LABELS
+
+        unreachable = any(step.max_loan_pkr is None for step in steps)
+        blocked_by = (
+            [
+                ML_FEATURE_LABELS.get(name, name)
+                for name, impact in sorted(
+                    (result.contributions or {}).items(), key=lambda item: item[1]
+                )
+                if impact < 0 and name != "loan_to_income"
+            ]
+            if unreachable
+            else []
+        )
+        if turnover <= 0:
+            blocked_by.insert(0, "No documented turnover")
+        return ApprovalPath(
+            requested_loan_pkr=loan,
+            monthly_turnover_pkr=turnover,
+            steps=steps,
+            blocked_by=blocked_by,
+        )
 
     # -- explaining -------------------------------------------------------
 
@@ -758,6 +1193,18 @@ def _requested_engine() -> str:
     return os.getenv("FORIFLOW_SCORING_ENGINE", "auto").strip().lower()
 
 
+def _fallback(reason: str) -> ScoringService:
+    """The surrogate engine, carrying the reason it is serving.
+
+    The reason is stored with the model record, written to the audit trail and
+    reported by ``/health``, so fallback scores are never mistaken for the
+    trained ensemble's.
+    """
+    service = ScoringService()
+    service.fallback_reason = reason
+    return service
+
+
 @lru_cache(maxsize=1)
 def get_scoring_service() -> ScoringService:
     """FastAPI dependency returning the shared, stateless scoring engine.
@@ -770,14 +1217,14 @@ def get_scoring_service() -> ScoringService:
     engine = _requested_engine()
     if engine == "surrogate":
         logger.info("Scoring engine pinned to the linear surrogate.")
-        return ScoringService()
+        return _fallback("pinned")
 
     if engine != "ml" and not artifacts_available():
         logger.warning(
             "No trained model artefacts found in backend/ml; falling back to the "
             "linear surrogate. Run 'python -m ml.train_real_model' to train one."
         )
-        return ScoringService()
+        return _fallback("artifacts_missing")
 
     try:
         service = MLScoringService.from_artifacts()
@@ -785,7 +1232,7 @@ def get_scoring_service() -> ScoringService:
         if engine == "ml":
             raise
         logger.exception("Failed to load model artefacts; using the linear surrogate.")
-        return ScoringService()
+        return _fallback("load_failed")
 
     logger.info("Scoring engine: %s", service.model_version)
     return service

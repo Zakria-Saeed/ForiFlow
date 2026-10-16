@@ -93,6 +93,17 @@ def bearer_header(username: str = TEST_ADMIN_USERNAME, role: str = "admin") -> d
     return {"Authorization": f"Bearer {token}"}
 
 
+@pytest.fixture(autouse=True)
+def _reset_login_rate_limit() -> Generator[None, None, None]:
+    """The per-address sign-in limiter lives in process memory; every test
+    signs in from the same TestClient address, so each starts with it clear."""
+    from services.login_guard import login_ip_limiter
+
+    login_ip_limiter.reset()
+    yield
+    login_ip_limiter.reset()
+
+
 @pytest.fixture(name="db_session_factory")
 def db_session_factory_fixture() -> Generator[sessionmaker[Session], None, None]:
     """Create a fresh in-memory SQLite schema for each test.
@@ -183,6 +194,29 @@ def ml_client_fixture(
     app.dependency_overrides[get_scoring_service] = lambda: ml_service
     yield client
     app.dependency_overrides[get_scoring_service] = lambda: ScoringService()
+
+
+DECISION_NOTE = "Reviewed the file and the evidence; the decision is recorded here."
+
+
+def decide(
+    client: TestClient,
+    application_id: int,
+    decision: str = "Approved",
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Record an officer decision (as the admin unless ``headers`` says otherwise).
+
+    Since 2.0 a recommendation is never a decision, so a test that needs an
+    approved facility has to approve it, exactly as an officer would.
+    """
+    response = client.post(
+        f"/score/applications/{application_id}/decision",
+        json={"decision": decision, "note": DECISION_NOTE},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
 
 
 @pytest.fixture(name="scored_application_id")

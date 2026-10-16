@@ -1,17 +1,29 @@
-/** Credit policy bands shared by the dial, tables and charts. */
+import { bandIndexForScore } from "./policyBands.js";
+
+/**
+ * Bands shared by the dial, tables and charts.
+ *
+ * Three different things are kept apart everywhere in the dashboard:
+ *   - the model's assessment (score, risk band),
+ *   - the policy's recommendation (Approve / Manual Review / Decline),
+ *   - the officer's decision (Approved / Rejected, or still pending).
+ * The API field `decision` holds the recommendation in its original wording
+ * ("Approved" = recommend approve). It is never the final decision.
+ */
 
 export const DECISION_APPROVED = "Approved";
 export const DECISION_MANUAL_REVIEW = "Manual Review";
 export const DECISION_REJECTED = "Rejected";
 
-/** Policy matrix: 0-40 Rejected, 41-70 Manual Review, 71-100 Approved. */
+/**
+ * Colours and wording for the three bands, low score to high. The cut-offs are
+ * not here: they come from the policy (see lib/policyBands.js).
+ */
 export const SCORE_BANDS = [
   {
     decision: DECISION_REJECTED,
+    recommendation: "Decline",
     riskBand: "High Risk",
-    min: 0,
-    max: 40,
-    range: "0 – 40",
     color: "#e11d48",
     softColor: "#ffe4e6",
     textClass: "text-rose-700",
@@ -22,10 +34,8 @@ export const SCORE_BANDS = [
   },
   {
     decision: DECISION_MANUAL_REVIEW,
+    recommendation: "Manual Review",
     riskBand: "Medium Risk",
-    min: 41,
-    max: 70,
-    range: "41 – 70",
     color: "#f59e0b",
     softColor: "#fef3c7",
     textClass: "text-amber-700",
@@ -36,10 +46,8 @@ export const SCORE_BANDS = [
   },
   {
     decision: DECISION_APPROVED,
+    recommendation: "Approve",
     riskBand: "Low Risk",
-    min: 71,
-    max: 100,
-    range: "71 – 100",
     color: "#059669",
     softColor: "#d1fae5",
     textClass: "text-emerald-700",
@@ -52,13 +60,13 @@ export const SCORE_BANDS = [
 
 const FALLBACK_BAND = SCORE_BANDS[1];
 
-/** Resolve the policy band for a 0-100 score. */
-export function bandForScore(score) {
-  const value = Number(score);
-  if (Number.isNaN(value)) return FALLBACK_BAND;
-  if (value <= 40) return SCORE_BANDS[0];
-  if (value <= 70) return SCORE_BANDS[1];
-  return SCORE_BANDS[2];
+/**
+ * The band style for a score under the given policy bands, or the neutral
+ * middle style when no bands are known yet.
+ */
+export function bandForScore(score, bands) {
+  const index = bandIndexForScore(score, bands);
+  return index === null ? FALLBACK_BAND : SCORE_BANDS[index];
 }
 
 /** Resolve the band from a decision string returned by the API. */
@@ -66,51 +74,27 @@ export function bandForDecision(decision) {
   return SCORE_BANDS.find((band) => band.decision === decision) ?? FALLBACK_BAND;
 }
 
-/**
- * The decision that stands: the model's band, or the officer's call on a
- * Manual Review case. `null` while that review is pending.
- */
+/** The recommendation wording for a stored `decision` value. */
+export function recommendationLabel(decision) {
+  return bandForDecision(decision).recommendation;
+}
+
+/** The officer's decision: "Approved", "Rejected", or `null` while undecided. */
 export function finalDecisionOf(application) {
   if (!application) return null;
-  if (application.final_decision !== undefined) return application.final_decision;
-  // Payloads without the field (older API) fall back to the model band.
-  return application.decision === DECISION_MANUAL_REVIEW ? null : application.decision;
+  return application.final_decision ?? null;
 }
 
+/** Pending, Escalated, Approved, Rejected or Superseded. */
+export function decisionStatusOf(application) {
+  return application?.decision_status ?? (finalDecisionOf(application) || "Pending");
+}
+
+/** Still waiting for an officer (pending, or escalated to an admin). */
 export function isPendingReview(application) {
-  return application?.decision === DECISION_MANUAL_REVIEW && finalDecisionOf(application) === null;
+  return ["Pending", "Escalated"].includes(decisionStatusOf(application));
 }
 
-/** Alert lifecycle styling. Active alerts are always red. */
-export const ALERT_STATUS_STYLES = {
-  Active: {
-    badgeClass: "bg-rose-100 text-rose-800 ring-1 ring-rose-300",
-    dotClass: "bg-rose-500",
-    rowClass: "bg-rose-50/40",
-  },
-  "In Review": {
-    badgeClass: "bg-amber-100 text-amber-800 ring-1 ring-amber-300",
-    dotClass: "bg-amber-500",
-    rowClass: "",
-  },
-  Resolved: {
-    badgeClass: "bg-slate-100 text-slate-600 ring-1 ring-slate-300",
-    dotClass: "bg-slate-400",
-    rowClass: "opacity-70",
-  },
-};
-
-export function alertStatusStyle(status) {
-  return ALERT_STATUS_STYLES[status] ?? ALERT_STATUS_STYLES.Resolved;
-}
-
-/**
- * Severity of an EWS alert. The backend triggers above a 15 point drop, so
- * anything past double that threshold is treated as critical.
- */
-export function alertSeverity(scoreDrop) {
-  const drop = Number(scoreDrop) || 0;
-  if (drop >= 30) return { label: "Critical", className: "bg-rose-600 text-white" };
-  if (drop >= 22) return { label: "High", className: "bg-rose-500 text-white" };
-  return { label: "Elevated", className: "bg-amber-500 text-white" };
-}
+// EWS alert statuses, severities and states are styled in lib/ews.js. The
+// severity of an alert comes from the API; the dashboard never derives it
+// from a score drop.

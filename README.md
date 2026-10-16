@@ -29,8 +29,9 @@ Pakistani SMEs face a financing gap:
 ForiFlow is an end-to-end AI credit intelligence platform that:
 
 - Scores unbanked SMEs using **alternative data** (digital payments and other officer-entered signals)
-- Provides **SHAP explainability** for every decision, stored on-premise to support an SBP-oriented review (ForiFlow is not SBP-certified and has no live ECIB connector)
-- Monitors approved borrowers (model-approved, or Manual Review approved by an officer) with an **Early Warning System** that raises an alert when the monthly score drops more than 15 points below origination, with an estimated runway to default (a heuristic, not validated on repayment data)
+- Gives a risk assessment and a policy **recommendation**; an authorised credit officer makes every decision
+- Provides **SHAP explainability** for every assessment, stored on-premise to support an SBP-oriented review (ForiFlow is not SBP-certified and has no live ECIB connector)
+- Monitors approved facilities with an **Early Warning System**: deterministic, rule- and trend-based monitoring of officer-recorded months (repayment, typed bureau balance, POS inflow). It keeps an immutable monthly history, shows where every score came from, computes a trend from three months, explains each NORMAL / WATCH / WARNING / CRITICAL state with evidence, and runs an audited alert lifecycle. It recommends follow-up; it does not predict default or change any facility
 
 ## 🏗️ Architecture
 
@@ -49,7 +50,7 @@ ForiFlow is an end-to-end AI credit intelligence platform that:
           └─────────────┘           └─────────────┘           └─────────────┘
 ```
 
-\* 5-fold CV 0.7752 ± 0.0073, hold-out 0.7731 (n=32,581, 3 features, trained on a public/proxy dataset — not a real SME portfolio).
+\* Final test set 0.7748 (5-fold CV on the training split 0.7743 ± 0.0073; 3 features; a demonstration model trained on public consumer credit data — not validated for Pakistani SME lending).
 
 In Docker the dashboard calls `/api` on its own origin and nginx forwards that
 prefix to FastAPI, so a bank laptop never has to configure CORS.
@@ -59,12 +60,22 @@ prefix to FastAPI, so a bank laptop never has to configure CORS.
 | Feature | Description |
 |---------|-------------|
 | 🎯 **AI Credit Scoring** | XGBoost + Random Forest soft-voting ensemble. Score: 0-100 |
-| 📊 **SHAP Waterfall Charts** | Every decision explained with feature attribution |
-| ✅ **Officer decision on Manual Review** | An admin approves or rejects each 41–70 case with a written reason; the model band, the officer's call, name and time are all kept, and only approved facilities can be monitored |
-| 🚨 **Early Warning System** | Officer-submitted monthly observation; a rule-based score is derived from the origination baseline and an alert fires on a >15-point drop |
+| 📊 **SHAP Waterfall Charts** | Every assessment explained with feature attribution, plus coded top risk factors (R01, R02, …) |
+| 📈 **Model page & model card** | Leakage-free protocol (train / validation / untouched final test), baselines (logistic regression, XGBoost, random forest), display-only calibrated PD, data-quality report, model evaluation thresholds shown apart from the credit policy, and a [model card](docs/model_card.md) |
+| 🧭 **Path to approval** | For a rejected or referred applicant, the exact facility size and the evidenced turnover at which the same business would reach the next band, found by searching the monotone model |
+| 🧾 **Turnover from a statement** | Upload a wallet or bank statement CSV; ForiFlow computes monthly turnover from the transactions, flags what to check, and records on the credit file whether the scored figures match the statement |
+| 📨 **Payment reminders** | Installments overdue, due within a week or in arrears, each with a drafted message in English and Roman Urdu to copy or open in WhatsApp |
+| 📉 **Population drift monitor** | Population Stability Index of the score and each model input against the training data, with the value chance alone would give at that sample size, so a small portfolio is not misread as drift |
+| 🧑‍⚖️ **Decision support, not auto-approval** | The model gives a risk assessment, a versioned and configurable credit policy turns it into a recommendation, and an authorised officer makes the decision. No score approves or rejects a loan |
+| 🧾 **Traceability** | Every application is filed under a borrower (one business, many applications, full history), stores the model version and engine that scored it, and every action is written to an append-only audit trail the database itself refuses to edit |
+| ⚖️ **Subgroup Performance Analysis** | Count, default rate, ROC-AUC, precision and recall per age band, income quarter, housing status and loan purpose on the final test set; small groups marked "Insufficient sample size"; states what cannot be analysed (no gender in the data) |
+| 🖨️ **Credit memo** | A printable one-page record per application: request, score, factor points, turnover evidence, decision and reason |
+| 💼 **Loan book analytics** | Disbursed, collected, overdue and outstanding amounts, portfolio at risk (30+ days), defaults, a decision matrix and a per-sector table, from the months officers record |
+| ✅ **Officer decision on every application** | A manager or admin approves, rejects or escalates each application with a written reason, whatever the policy recommended; the recommendation, the officer's decision, name and time are all kept, and only approved facilities can be monitored |
+| 🚨 **Early Warning System** | Immutable monthly history with score provenance, OLS trend from three months, six evidence-backed signals, NORMAL / WATCH / WARNING / CRITICAL states, one open alert per facility with an audited lifecycle (acknowledge, assign, due date, action, resolve, dismiss). Rule-based, not a default model ([docs/ews.md](docs/ews.md)) |
 | 🏦 **PKR Banking Context** | PKR amounts; designed for SBP-oriented explainability (not SBP-certified, no live ECIB feed) |
 | 🐳 **Docker Ready** | One-command deployment for bank demos |
-| 🔐 **JWT Authentication** | On-premise login (bcrypt, HS256, 8-hour tokens); roles admin and analyst, with Manual Review decisions, resolving alerts and creating officer accounts admin-only; every assessment records who scored it |
+| 🔐 **JWT Authentication** | On-premise login (bcrypt, HS256, 8-hour tokens, sign-out revocation, lockout after 5 wrong passwords, admin-disabled accounts); three roles (analyst, manager, admin): managers decide Manual Review cases (approving up to a configurable facility limit) and resolve alerts, admins also manage officer accounts; every assessment records who scored it. Security baseline and limits: [SECURITY.md](SECURITY.md) |
 
 ## 🛠️ Tech Stack
 
@@ -85,6 +96,7 @@ prefix to FastAPI, so a bank laptop never has to configure CORS.
 ![EWS Alerts](docs/screenshots/05-ews-alerts.png)
 ![Applications](docs/screenshots/06-applications.png)
 ![API Docs](docs/screenshots/07-swagger.png)
+![Model Performance](docs/screenshots/08-model-performance.png)
 
 
 ## 🚀 Quick Start
@@ -119,7 +131,8 @@ in `frontend/`. Vite proxies `/api` to the API.
 
 ## 📊 Performance
 
-- **AUC-ROC:** 5-fold CV 0.7752 ± 0.0073, hold-out 0.7731 (n=32,581, 3 features, trained on a public/proxy dataset — not a real SME portfolio). 0.85+ remains a bank-data target, not a measured result.
+- **AUC-ROC:** final test set 0.7748 (6,484 loans, measured once); 5-fold CV on the training split 0.7743 ± 0.0073 (3 features, public consumer credit data — not a real SME portfolio). Logistic regression reaches 0.7630 and XGBoost alone 0.7744: the ensemble adds nothing meaningful over XGBoost alone. 0.85+ remains a bank-data target, not a measured result.
+- **Calibration (final test):** Brier 0.1845 raw → 0.1304 with an isotonic calibrator chosen and fitted on the validation split (0.1709 for always predicting the base rate). Display only; calibrated to the public file's 21.9% default rate, not to Pakistani SMEs.
 - **Response time:** median 150 ms, p90 207 ms per score including SHAP (30 runs in the Docker container on the development laptop, 26 September 2026)
 - **Concurrency:** not load-tested; the shipped Compose stack runs a single uvicorn process behind nginx, sized for a single-branch pilot
 

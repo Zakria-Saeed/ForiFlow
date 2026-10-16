@@ -25,6 +25,653 @@ All notable changes to ForiFlow are recorded here. The format follows
 - `backend/.dockerignore` excludes `.env` files so local secrets never enter
   the image.
 
+## [2.3.1] - 2026-10-10
+
+Production configuration fix. Backend only; no model, SHAP, EWS, policy,
+decision, score, borrower or audit change.
+
+### Changed
+
+- **Production never serves `/docs`, `/redoc` or `/openapi.json`.** In 2.3.0
+  an explicit `FORIFLOW_ENABLE_DOCS=true` in `.env` turned them back on in
+  production (with only a warning). It is now ignored in production and
+  logged as such; `docker-compose.yml` also pins the API container's
+  `FORIFLOW_ENABLE_DOCS` to `false`. Development is unchanged (on unless set
+  to `false`).
+- `.env.example` sets `FORIFLOW_ENABLE_DOCS=false` and says to remove
+  `FORIFLOW_ADMIN_PASSWORD` once the first admin exists.
+- Tests: production keeps all three documentation endpoints at 404 for every
+  value of the flag; development still serves them.
+
+## [2.3.0] - 2026-10-09
+
+Production and security hardening for a controlled pilot. No change to the
+model, its weights or metrics, the scoring formula, SHAP, the EWS method or
+thresholds, the credit policy, the decision workflow, borrower history or the
+meaning of audit entries. ForiFlow has not undergone an independent
+penetration test or formal security certification; see
+[SECURITY.md](SECURITY.md) for the baseline and its limits.
+
+### Added
+
+- **Sign-in protection.** 5 wrong passwords for one username within 15
+  minutes lock it for 15 minutes (`429` with `Retry-After`), for unknown
+  usernames too, so a lock reveals nothing; the lock lifts by itself. At most
+  30 sign-in requests per 5 minutes from one address. An unknown username
+  costs the same bcrypt time as a wrong password.
+- **Sign-out revokes the token** (`POST /auth/logout`). Tokens now carry a
+  random `jti` and `iss=foriflow`; all claims are required.
+- **Disable / re-enable accounts** (`PATCH /auth/users/{id}/status`, Team &
+  Roles page). A disabled account is refused on its next request and at
+  sign-in (`403` only with the correct password). An admin cannot disable
+  themselves or the last enabled admin. Nothing is deleted.
+- **Password rule** when a password is set: 12–72 characters, not a common
+  password, sequence, near-repetition, the placeholder, or containing the
+  username (NIST SP 800-63B style; sign-in does not re-check it).
+- **Production mode** (`FORIFLOW_ENV=production`, set by Docker Compose): the
+  API refuses to start on a missing, placeholder or short JWT secret, SQLite,
+  an empty, placeholder or well-known database password, or invalid CORS /
+  token / body settings. The log names settings, never values.
+- **`/health/live` and `/health/ready`** (`503` naming the failing check);
+  the backend healthcheck now uses readiness.
+- **Security headers** on every API response (CSP, nosniff, frame deny,
+  referrer, permissions, COOP/CORP, `Cache-Control: no-store`, HSTS over
+  HTTPS) and on the dashboard (nginx CSP `default-src 'self'`, no inline
+  script). `Server` header removed from both.
+- **Request body limit**: 3 MiB in the API (`413`; malformed
+  `Content-Length` `400`), 4 MiB in nginx.
+- **Generic 500 handler**: `{"detail": …, "request_id": …}`, traceback only in
+  the server log.
+- **Backup, verify, restore**: `backup.bat`, `verify-backup.bat` (restore into
+  a scratch database and compare counts, migration, newest audit entry and
+  audit triggers), `restore.bat` (safety backup, typed confirmation); shell
+  equivalents in `scripts/`. See [docs/backup-restore.md](docs/backup-restore.md).
+- **Audit events**: `auth.login_locked`, `auth.login_refused_locked`,
+  `auth.login_rate_limited` (once per window), `auth.login_refused_disabled`,
+  `auth.logout`, `user.disabled`, `user.enabled`. Sign-in and sign-out record
+  a `session_id` (the `jti`), never the token.
+- Migration `0010_security_hardening`: `users.is_active` (existing accounts
+  enabled), `login_attempts`, `revoked_tokens`. Reversible.
+- Tests: `test_security.py` (51; the role matrix is read off every route, so
+  a new route without its check fails) and `test_postgres_security.py` (7).
+- `SECURITY.md`, `docs/backup-restore.md`.
+
+### Changed (security behaviour, deliberate)
+
+- **Officers sign in again once after the upgrade**: tokens issued before
+  2.3 have no `jti`/`iss` and are refused.
+- **Interactive docs are off in production** unless `FORIFLOW_ENABLE_DOCS=true`
+  (a warning is then logged). They stay on in development.
+- **CORS** comes from `FORIFLOW_CORS_ORIGINS`; none in production by default,
+  `*` refused, no credentials mode (the token is a header).
+- **Phone numbers are masked** in `GET /score/applications` and
+  `GET /borrowers` lists; the full number stays on the record and the
+  Reminders page.
+- **nginx runs as an unprivileged user**; both app containers drop every
+  Linux capability and set `no-new-privileges`.
+- `422` responses no longer carry Pydantic documentation links.
+- The dashboard signs out through the API, refreshes the role from
+  `/auth/me`, and on any `401` returns to sign-in with "Your session has
+  ended"; 5xx errors show a reference id instead of server text.
+- Frontend Docker build checks that the native build modules load and
+  reinstalls once if npm skipped one (the 2.2.1 build failure).
+
+### Security fixes in dependencies
+
+- `axios` 1.19.0 → 1.20.0 (12 advisories, high) and `source-map-js` 1.2.1 →
+  1.2.2 (high, build-time only), via `npm audit fix` without `--force`.
+  `npm audit`: 0 vulnerabilities. `pip-audit`: no known vulnerabilities in the
+  runtime Python packages. Remaining, non-blocking: `passlib` is unmaintained
+  (see SECURITY.md §11).
+
+## [2.2.1] - 2026-10-08
+
+Fix for two faults found when 2.2.0 was deployed on Docker with PostgreSQL.
+No model, metric, threshold or score changes.
+
+### Fixed
+
+- **The 2.2 model was never registered on PostgreSQL.** The training metadata
+  recorded XGBoost's `missing` setting as a bare `NaN`, which PostgreSQL JSONB
+  rejects. Registration at startup failed (logged), the 2.1 row stayed marked
+  active, and every new score would have failed with HTTP 500 at the same
+  step. SQLite accepts `NaN`, so the SQLite suite and the earlier PostgreSQL
+  tests (which inserted hand-written rows) did not catch it.
+  `feature_names.json` now records `"missing": "NaN"` as text, the trainer
+  writes it that way, and the registry turns any non-finite number into text
+  before storing it. New PostgreSQL test registers the real model, with the
+  `NaN` put back, and fails without the fix.
+- **The artifact fingerprint depended on the machine.** A Windows checkout
+  stores `feature_names.json` with CRLF line endings, so the same model got a
+  different `artifact_sha256` on the laptop. JSON metadata is now hashed with
+  LF endings. The fingerprint of the 2.2 model is now
+  `15a24f14f148…` (it also changed because of the `NaN` fix above).
+
+### Unchanged
+
+- The trained model, scaler, explainer, calibrator, all evaluation files and
+  every stored score. The 2.1 model row stays as it is (retired once the 2.2
+  model registers).
+
+## [2.2.0] - 2026-10-08
+
+Phase 4: ML and data credibility. The model is made more defensible and more
+transparent, not more impressive. It remains a **demonstration model trained
+on public consumer credit data; it is not validated for Pakistani SME lending
+and must not be used for autonomous credit decisions** (see
+[docs/model_card.md](docs/model_card.md)). No change to the EWS, the alert
+lifecycle, the policy engine, the human decision workflow, borrower history,
+the audit trail or the scoring API contracts. The score is still
+`100 × (1 − raw ensemble probability)`.
+
+### Fixed
+
+- **Preprocessing leakage.** Imputation medians and 1st/99th percentile clip
+  bounds were learned on the whole file before the split. They are now learned
+  on the training split only (and per fold in cross-validation), with the
+  scaler; SMOTE runs on training rows only. Exact duplicate rows (165) are
+  dropped before the split so a copy cannot sit on both sides.
+- **Reused hold-out.** Training now splits train 60% / validation 20% / final
+  test 20% (stratified, seed 42, row-id fingerprints recorded). The calibrator
+  and the baseline comparison use the validation split; the final test set is
+  measured once by `ml.evaluate_model`, which refuses a second run for the
+  same model and refuses a split that differs from training's.
+- **SHAP at split ties.** An input exactly on a split threshold (for example
+  0.5 years in operation) could be explained against the neighbouring leaf of
+  the random forest, so the contributions missed the score by up to about 0.1
+  points. Each member's attributions are now checked to add up to its own
+  prediction (to 1e-6) and, at a tie, computed one float32 step away, where
+  the model scores identically.
+- **Wording.** The SHAP base value is the "model reference baseline" (the score
+  of a SMOTE-balanced reference sample), not a portfolio average. The
+  calibrated probability is labelled "Calibrated PD (display only)".
+
+### Added
+
+- `ml/pipeline.py` (the protocol), `ml/data_quality.py` and
+  `ml/data_quality_report.json`.
+- Baselines under the same protocol: logistic regression, XGBoost alone,
+  random forest alone, the ensemble (CV on the training split, validation,
+  final test).
+- Calibration analysis: isotonic and Platt compared by out-of-fold Brier on the
+  validation split; raw against calibrated Brier and ECE on the final test set.
+- Model metadata: dataset identifier and SHA-256, dataset type, split and
+  fingerprints, seed, preprocessing version, model configuration, calibration,
+  validation metrics and the previous model's figures.
+- Migration `0009_model_provenance`: `model_versions.provenance` (nullable
+  JSON). Earlier rows keep it NULL; nothing is invented.
+- `GET /model/card`, `GET /model/data-quality`, `GET /model/feature-contract`.
+- Model page: model status, final-test performance, "Model Evaluation
+  Thresholds" beside "Current Credit Policy Thresholds", baseline comparison
+  with an explicit verdict, calibration, data quality, limitations; evaluation
+  detail collapsed. "Subgroup Performance Analysis" replaces the group audit
+  (count, default rate, ROC-AUC, precision, recall; "Insufficient sample size"
+  for small groups). Drift is labelled "Reference / Demo Distribution".
+- The application form marks unused fields from the serving model's feature
+  contract.
+- Docs: [model card](docs/model_card.md),
+  [SME data requirements](docs/sme_data_requirements.md).
+
+### Results (honest, including where they do not flatter the model)
+
+| | 2.1 (leaky protocol) | 2.2 |
+|---|---|---|
+| CV ROC-AUC | 0.7752 ± 0.0073 (whole file) | 0.7743 ± 0.0073 (training split) |
+| Hold-out / final-test ROC-AUC | 0.7731 (reused hold-out) | **0.7748** (final test, once) |
+| PR-AUC | 0.5645 | 0.5671 |
+| F1 at raw PD 0.5 | 0.5464 | 0.5506 |
+| Brier raw / calibrated | 0.1852 / 0.1302 | 0.1845 / 0.1304 |
+
+The figures moved by less than their spread; the leak did not inflate them
+materially. Logistic regression reaches 0.7630 and XGBoost alone 0.7744: the
+ensemble adds nothing meaningful over XGBoost alone.
+
+### Model
+
+- New model version `ensemble-xgb-rf-credit_risk_shared-2026-10-08T17:36:16`,
+  registered beside the 2.1 model. Existing applications keep their scores,
+  model versions, SHAP reports and policy snapshots; nothing is re-scored.
+
+### Known limits
+
+- Consumer data, three features, mapped proxies; no SME or Pakistani data.
+- The dataset choice made in release 1.x (by CV over whole files) is not re-run.
+- No time-based validation; the file has no dates.
+
+## [2.1.0] - 2026-10-08
+
+Phase 3: the Early Warning System becomes historical, explainable, auditable
+and actionable, and says plainly what it is: deterministic, rule- and
+trend-based monitoring of officer-recorded months, not a model that predicts
+default. No change to the model, the probability, the score, SHAP,
+calibration, the credit policy or the decision workflow. Method and limits:
+[docs/ews.md](docs/ews.md).
+
+### Changed (deliberate reversals)
+
+- **A recorded month is no longer overwritten.** Recording a month that is
+  already on file returns `409`. A manager or admin corrects it with
+  `POST /ews/observations/{id}/correct` and a reason: a new row is added and
+  the original is kept, marked `superseded`, with both linked.
+- **A typed score is an officer override.** `current_score` needs a manager
+  or admin and an `override_reason`; it is stored as
+  `score_source = officer_override` next to the rule score it replaced, and an
+  analyst's attempt is refused (`403`) and audited.
+- **Alert statuses**: `Active` / `In Review` / `Resolved` become `Open` /
+  `Acknowledged` / `Action Required` / `Resolved` / `Dismissed`. Taking or
+  following up an alert is a manager's or admin's step (was any officer).
+  `PATCH /ews/alerts/{id}/review` and `/resolve` still work.
+- **The Markov chain no longer raises alerts.** Its 10% line flagged exactly
+  Late 60-89 and Default, which the rules already mark CRITICAL, and it is
+  fitted on consumer card accounts. Its probability is still returned with a
+  month, labelled reference only.
+
+### Added
+
+- Observation history: date, days late (checked against the bucket), score
+  source, rule score, author, time, request id, correction links and the EWS
+  assessment as of that month. One active row per facility and month is
+  enforced by the database.
+- Score provenance shown everywhere: origination assessment, EWS rules,
+  officer override, unknown (before 2.1). A manual value is never presented as
+  a model score.
+- Trend: baseline, latest, total and recent deterioration, OLS slope and a
+  direction from three months; "Insufficient Data" below that.
+- Six deterministic signals with stable codes and evidence
+  (`PAYMENT_DELAY_INCREASED`, `BALANCE_INCREASED`, `POS_CASH_FLOW_DECLINED`,
+  `RISK_SCORE_DECLINED`, `RISK_TREND_DETERIORATING`,
+  `MULTIPLE_NEGATIVE_SIGNALS`) and the states NORMAL / WATCH / WARNING /
+  CRITICAL, separate from credit risk bands.
+- Alerts at WARNING and CRITICAL with severity, reason codes, evidence,
+  previous and current score, recommended actions and the observations they
+  rest on. One open alert per facility (database index); severity only rises
+  while open.
+- Alert lifecycle with acknowledgement, assignee, due date, action note,
+  overdue flag, resolution and dismissal, every step audited;
+  `GET /ews/alerts/{id}/history`.
+- `GET /ews/overview`, `/ews/methodology`, and per facility
+  `/observations`, `/trend`, `/state`, `/timeline` (stored events only).
+- Dashboard EWS page: portfolio tiles, facility table, score-history chart
+  (baseline drawn apart, overrides marked, insufficient-history message),
+  state reasons, signals and actions, recorded months with corrections,
+  timeline, the alert queue with its lifecycle, and the methodology read from
+  the API. The dashboard holds no EWS threshold.
+- Tests: the engine, the API and roles on SQLite, migration 0008 and the
+  workflow on PostgreSQL, and frontend helpers.
+
+### Migration
+
+- `0008_ews_history_alerts`. No row deleted, nothing invented: existing
+  observations are marked `legacy_unknown` and `active`; alert statuses are
+  renamed (Active to Open, In Review to Acknowledged, keeping who had taken
+  it); legacy alerts keep severity and reasons empty. It stops if a facility
+  has two open alerts. Downgrade is refused while corrections exist.
+
+### Known limits
+
+- Monthly figures are typed; there is no bureau, bank or POS integration.
+- The thresholds are judgement, not calibrated on SME outcomes.
+- The monitored score is the origination score minus rule penalties, not a
+  fresh model assessment (`latest_foriflow_assessment` is reserved).
+- No notifications are sent.
+- Alerts are evaluated when a month is recorded or corrected; the migration
+  does not raise alerts on pre-2.1 history, which the dashboard still shows
+  with its live state.
+
+## [2.0.1] - 2026-10-08
+
+Corrective release. No change to the model, the probability, the score, SHAP,
+the EWS, the borrower and audit records or the decision workflow.
+
+### Fixed
+
+- **Band drawings now follow the policy instead of fixed 40 / 70 values.**
+  In 2.0.0 the score dial and the dashboard histogram were still drawn with
+  cut-offs hard-coded in the dashboard, so under a policy such as 45 / 74 a
+  score of 72 was recommended Manual Review by the API while the dial drew it
+  in the Approve arc.
+  - Every application now returns `policy.bands`: the cut-offs it was assessed
+    under, from its stored policy snapshot (`source: policy_snapshot`). An
+    application scored before 2.0 reports the fixed rule of that time
+    (`legacy_fixed_rule`, 40 / 70). Activating a new policy never redraws an
+    old assessment.
+  - The dial draws its three arcs and legend from those bands; an empty dial
+    uses `GET /policy/active`. The highlighted band is always the API's
+    recommendation.
+  - `/score/stats` cuts the histogram on the active policy (two bars per band,
+    edges on the cut-offs) and returns each bar's `risk_band` and
+    `recommendation`, plus `histogram_policy_version` and `histogram_bands`.
+    For the demo policy the bars are unchanged (0-20 … 85-100).
+  - The dashboard no longer holds any cut-off. The Model Performance page now
+    labels its 40 / 70 figures as model evaluation cut-offs, not the credit
+    policy in force.
+
+### Added
+
+- Frontend unit tests (`npm test`, Node's built-in runner, no new package) for
+  the band arithmetic under policies 40 / 70 and 45 / 74; run in CI.
+
+## [2.0.0] - 2026-10-07
+
+Phase 2: a human-in-the-loop decision workflow and a versioned credit policy.
+The model, its probability, the 0-100 score, the SHAP values and the EWS rules
+are unchanged. The version is 2.0.0 because one behaviour is deliberately
+reversed (see "Changed").
+
+### Changed (breaking)
+
+- **No score decides a loan any more.** Until 1.10 an Approved or Rejected band
+  was final and only Manual Review went to an officer. Now the model produces
+  an assessment, the policy produces a **recommendation**, and every
+  application stays `Pending` until a manager or admin records the decision.
+  Only an approved application can be monitored by the EWS. API field names
+  and types are unchanged; `decision` now means "what the policy recommends".
+
+### Added
+
+- **Versioned credit policy** (`credit_policies`, `GET /policy/active`,
+  `GET/POST /policy/versions`, `POST /policy/versions/{id}/activate`). The
+  score cut-offs and the manager approval limit are policy configuration, no
+  longer constants in the scoring code. One version is active; a version is
+  never edited or deleted; each application stores the version and a snapshot
+  of the rule that applied. Only an admin creates or activates a version. The
+  shipped version 1.0 is a **demo policy** with the values ForiFlow has always
+  used (40 / 70 / PKR 2,000,000). They are not validated for Pakistani SME
+  lending and were not tuned on any data.
+- **Human decision workflow.** `POST /score/applications/{id}/decision`
+  (`/review` still works) takes `Approved`, `Rejected` or `Escalated`.
+  Enforced on the server: a manager approves up to the policy limit, rejects,
+  or escalates; approving above the limit, approving against a Decline
+  recommendation and deciding an escalated application need an admin. A
+  refused action returns `403` and is audited.
+- **Three separate objects on every application**: `assessment` (model),
+  `policy` (recommendation, rule, authority), `officer_decision` (human), plus
+  `recommendation`, `decision_status`, `risk_band` and both probabilities.
+- **Re-scoring without overwriting.** `rescore_of_application_id` stores a new
+  application and marks the earlier one Superseded, unchanged. The audit entry
+  records who re-scored and which inputs changed.
+  `GET /score/applications/{id}/decision-history` returns the chain and events.
+- **Reason codes** (R01 to R10): the top risk factors of an explanation as
+  stable codes, derived deterministically from the SHAP contributions. Only for
+  features an explanation can contain; the served model yields R01 to R03.
+- Audit actions: `recommendation.generated`, `application.escalated`,
+  `application.rescored`, `application.superseded`, `policy.created`,
+  `policy.activated`, `policy.retired`.
+- Dashboard: the decision panel shows Risk assessment, ForiFlow recommendation
+  and Credit officer decision as three parts, with Approve / Reject / Escalate;
+  a Credit Policy page (read for all, create and activate for admins).
+
+### Migration
+
+- `0007_policy_human_decision`. Existing applications keep their outcome:
+  an officer's decision stays as recorded; an Approved or Rejected band from
+  before 2.0 is kept as that outcome with `decision_source = legacy_auto` and
+  no officer invented; undecided Manual Review cases are Pending. Their
+  `policy_version` stays NULL, because none was recorded.
+- `MANAGER_APPROVAL_LIMIT_PKR` is read once, to set the first policy's limit.
+
+### Known limits
+
+- The score dial and the dashboard histogram are drawn with the demo cut-offs
+  (40 / 70); a policy with other cut-offs labels scores correctly but the
+  drawings do not move.
+- Re-scoring is an API field; the dashboard has no re-score button yet.
+- `ml.evaluate_model` and `ml.fairness_audit` report hold-out results for the
+  demo cut-offs only.
+
+## [1.10.0] - 2026-10-07
+
+Phase 1 of the bank-facing foundation: traceability. No change to the model,
+the SHAP values, the score, the policy bands or the EWS rules.
+
+### Added
+
+- **Borrowers.** A `borrowers` table for the business itself; an application
+  now belongs to one (`applications.borrower_id`, NOT NULL). `POST /score`
+  files the application under the borrower named by `borrower_public_id`, else
+  the one holding the given CNIC or NTN, else a new one. A matching name never
+  links two applications. New routes: `GET/POST /borrowers`,
+  `GET/PATCH /borrowers/{ref}` and `GET /borrowers/{ref}/history` (every
+  application with its score, band, officer decision, model version,
+  monitored months and alerts). The identifier is optional, unique when
+  present, returned masked and never accepted in a URL.
+- **Append-only audit trail.** `audit_logs` records logins (both outcomes),
+  officer accounts, borrowers, applications, scores, explanations, officer
+  decisions and refused approvals, monthly observations and alerts, with the
+  actor, role, before and after state, caller address and request id. Entries
+  are written in the same transaction as the change. Updates and deletes are
+  refused by the ORM and by database triggers (UPDATE, DELETE, TRUNCATE).
+  `GET /audit/logs` (admin) reads it; nothing writes to it over the API.
+  Every response carries `X-Request-ID`.
+- **Model version tracking.** Each application stores `model_version`,
+  `scoring_engine` (`ml` or `surrogate`) and a link to a new `model_versions`
+  table, which records each model's SHA-256 artefact fingerprint, dataset,
+  feature set, trained date, metrics and whether it is active.
+  `GET /model/versions` and `/model/versions/active` read it.
+- A re-submitted monitoring month still overwrites its row, but the figures it
+  replaced are now kept in the audit entry.
+
+### Changed
+
+- **A fallback to the surrogate formula is no longer silent.** When the trained
+  model's files are missing or fail to load, the reason is logged as an error,
+  reported by `GET /health` (`scoring_engine`, `scoring_fallback_reason`),
+  stored on the model record and on every application scored in that state,
+  and written to the audit trail. Scoring behaviour itself is unchanged.
+- Validation errors no longer echo a rejected CNIC or NTN.
+- `scripts.migrate_sqlite_to_postgres` copies the new tables and gives each
+  application of a pre-1.10 SQLite file its own borrower.
+
+### Migration
+
+- `0006_borrowers_audit_models`. Each existing application gets its own
+  borrower, in application-id order, from its own details; none are merged.
+  The model version is copied from each stored explanation. No row is deleted.
+  See "Migration notes" in `docs/architecture.md`.
+
+### Known limits
+
+- `/ews` routes and the `alerts` / `ews_tracking` tables still call the
+  application id `borrower_id`. Renaming it would break existing clients.
+- Applications scored before 1.10 are not linked to a `model_versions` row.
+- Two pre-1.10 applications from the same business are separate borrowers;
+  there is no merge tool yet.
+
+## [1.9.0] - 2026-10-05
+
+### Added
+
+- **Group audit of the model.** `python -m ml.fairness_audit` takes the same
+  20% hold-out as the evaluation, joins each loan to four attributes of the
+  public file that the model never reads (age, income, housing, loan purpose)
+  and records, per group: the approval rate and its ratio to the best group
+  (the four-fifths screen), the model's probability of default against the
+  default rate the group really had, good payers rejected and defaulters
+  approved. Served at `GET /model/fairness` and shown on the Model Performance
+  page. Findings on the 6,517 hold-out loans:
+  - Age: every age band is priced in line with its outcome (largest gap 1.7
+    points). Under-25s are approved at 0.66 of the rate of the 45-and-over
+    band, and they do default more (23.4% against 20.5%).
+  - Housing: the largest mispricing. Outright owners are given 24.5% and
+    defaulted 8.1%; renters are given 24.3% and defaulted 31.2%. The model has
+    no input for assets or collateral.
+  - Income: the lowest quarter is approved at 0.22 of the top quarter's rate,
+    yet the model is lenient to it (30.8% given, 39.6% defaulted) and harsh to
+    the top quarter (14.5% given, 9.1% defaulted).
+  - Loan purpose: business-venture loans are given 21.6% and defaulted 14.6%.
+  The file has no gender, region, religion or ethnicity, so none of those is
+  audited, and these are consumer loans, not Pakistani SMEs. Nothing in the
+  audit changes the model.
+- **Approval authority by facility size.** A manager may approve a Manual
+  Review facility up to `MANAGER_APPROVAL_LIMIT_PKR` (default 2,000,000, a
+  policy figure the lender sets); above it only an admin may approve, and the
+  API answers `403` naming both amounts. A manager can still reject at any
+  size. Every application now reports `approval_authority` and
+  `manager_approval_limit_pkr`, and the decision panel disables Approve and
+  says why.
+
+## [1.8.0] - 2026-10-05
+
+### Added
+
+- **Population drift monitor.** `GET /model/drift` compares every stored
+  application with the population the model was trained on, using the
+  Population Stability Index for the score and for each model input (facility
+  size against turnover, repayment history, years in operation). Inputs are
+  rebuilt exactly as scoring builds them. Each figure comes with the PSI that
+  chance alone would give at that sample size, about (bins - 1) / rows, and no
+  verdict is given below 100 applications. `ml.evaluate_model` records the
+  reference distributions. The Model Performance page shows training against
+  live shares bin by bin.
+- **Credit memo.** A printable page per application (`/memo/{id}` in the
+  dashboard, linked from the decision panel): the request, score, probability
+  of default, each factor's points, path to approval, where the turnover came
+  from, and who decided and why. Read from the stored record only.
+
+### Fixed
+
+- **Scoring failed with a 500 for some applicants (1.5.0 to 1.7.1).** When
+  neither a smaller facility nor a higher turnover could move an applicant
+  into a better band, for example a Manual Review case with an adverse
+  repayment record and under a year of trading, the path-to-approval search
+  had nothing left to score on its second pass and raised. The assessment
+  was not saved. It now returns the empty path and names what blocks it. A
+  regression test pins that applicant, and a seeded test scores 300 applicants
+  across the extremes of every input and checks each reported threshold.
+
+## [1.7.1] - 2026-10-04
+
+### Fixed
+
+- The frontend image build retries `npm ci` once. On Docker Desktop the
+  esbuild install step can fail with `ETXTBSY` ("text file busy"), which
+  stopped the 1.7.0 rebuild; it is a timing fault and a clean retry passes.
+
+## [1.7.0] - 2026-10-04
+
+### Added
+
+- **Turnover from a statement.** `POST /score/statement` reads a wallet or bank
+  statement CSV and returns the median monthly inflow and net cash flow over
+  full calendar months, how much the inflows vary, and warnings to check by
+  hand (one inflow above 25% of the total, months with more out than in,
+  failed or unreadable rows). The scoring form fills digital payments, cash
+  flow and order consistency from it. When the statement is sent with the
+  application, the API re-reads it and stores the summary as
+  `turnover_evidence`, with `matches_statement` false if a figure was changed
+  afterwards. Raw transactions are not kept. The parser matches common column
+  names; it does not compute a repayment-history score, which the model reads
+  as a bureau record. `docs/samples/` has a synthetic statement for demos.
+- **Manager role.** Three roles, each including the one below: `analyst`
+  (score, monitor, take alerts), `manager` (also decide Manual Review cases
+  and resolve alerts), `admin` (also manage officer accounts). Existing
+  accounts keep their role. A Team & Roles page lets an admin list and create
+  accounts.
+- **Payment reminders.** `GET /portfolio/reminders` lists installments that
+  are overdue, due within 7 days, or unpaid from earlier months, with a
+  drafted message in English and Roman Urdu. The schedule runs monthly from
+  the approval date; an installment is cleared once its month is recorded.
+  The Reminders page copies the message or opens it in WhatsApp when the
+  application carries the optional `contact_phone`. ForiFlow sends nothing.
+- Migration `0005_roles_and_evidence`: widens the role check, adds nullable
+  `turnover_evidence_json` and `contact_phone`.
+
+### Fixed
+
+- Comments on the fallback engine's weights and bounds claimed they were
+  agreed with a credit policy team and calibrated on a reference portfolio.
+  They were set by hand; the comments now say so.
+
+## [1.6.0] - 2026-10-04
+
+### Added
+
+- **Early-warning Markov chain.** `python -m ml.ews_markov` fits monthly
+  transitions between Current, Late 1-59, Late 60-89 and Default on the UCI
+  "Default of Credit Card Clients" file (30,000 accounts, six months each),
+  using 24,000 accounts to fit and 6,000 to check, and writes
+  `ml/ews_transition.json`. Monitoring now returns `default_probability_3m`
+  (0.09%, 2.66% and 30.07% for the three live states) and takes
+  `estimated_days_to_default` from the chain (246, 160 and 54 days; the mean
+  time to Default given it happens within 12 months). An alert is raised at
+  10% or more, or on the existing drop of more than 15 points, which still
+  carries the bureau and POS signals.
+- The script also records how the chain does on unseen accounts and against
+  a second-order chain, a logistic hazard model and gradient boosting. The
+  hazard models rank better (AUC 0.915 and 0.921 against 0.855) but need
+  inputs with no clean counterpart on a term loan, so they are not served.
+- `GET /model/early-warning`, and an Early-warning model section on the Model
+  Performance page: transition matrix, outlook per state, hold-out check,
+  alternatives.
+
+### Changed
+
+- `estimated_days_to_default` no longer comes from the hand-set runway table
+  when the chain is loaded: a Late 60-89 month reports 54 days, not 12 to 45.
+  The rule-based estimate remains as the fallback (`runway_basis: "rules"`).
+- The chain is fitted on consumer card accounts in Taiwan in 2005, not on
+  Pakistani SME loans; the API, the screens and the risk register say so.
+
+## [1.5.0] - 2026-10-04
+
+### Added
+
+- **Path to approval.** For a Rejected or Manual Review outcome the trained
+  ensemble reports the largest facility (rounded down to PKR 1,000) and the
+  smallest evidenced monthly turnover (rounded up) at which the same applicant
+  reaches Manual Review and Approved. Both members carry monotone constraints,
+  so each crossing point is unique; three batched grid passes find it in about
+  60 ms and the result is re-scored after rounding. When no facility size
+  reaches a band, the factors holding it back are named. Stored with the
+  explanation as `approval_path` and shown under the SHAP report and the
+  scoring result. It is a model output for the officer, not an offer.
+- **Loan book analytics.** `GET /portfolio/summary` reports disbursed, due,
+  collected, overdue and outstanding amounts, the collection rate, portfolio
+  at risk (outstanding 30 or more days late in the latest month), defaulted
+  facilities, the model-band by final-outcome decision matrix, and a table
+  per business sector. The dashboard shows it as a Loan book section.
+  Installments are straight-line (facility / tenure): ForiFlow holds no
+  interest rate. Months without a recorded amount are counted and left out
+  of the collection figures, never estimated.
+- Applications take an optional `business_sector` (reporting only, the model
+  does not read it) and `POST /ews/monitor` an optional `amount_paid_pkr`.
+  Migration `0004_portfolio_fields` adds both columns as nullable.
+- `docs/risk-register.md`: model, data, process and security risks, what
+  ForiFlow does about each today and what a bank would still need.
+- `ml.evaluate_model` records the Spearman correlation between the model's
+  features (largest 0.055 in absolute value).
+
+### Changed
+
+- The calibrator is fitted over bins of 250 loans, so it never reports a
+  probability of exactly 0% or 100% from a handful of loans. Hold-out Brier
+  0.1302, expected calibration error 0.0091.
+
+## [1.4.0] - 2026-10-03
+
+### Added
+
+- **Calibrated probability of default.** `python -m ml.evaluate_model` fits an
+  isotonic regression on out-of-fold predictions of the training part and
+  stores its breakpoints in `ml/model_evaluation.json`. Every score now returns
+  `probability_of_default`, and it is saved inside the stored explanation. On
+  the hold-out the Brier score falls from 0.1852 (worse than the 0.1706 of
+  always predicting the base rate) to 0.1305, and the mean prediction from
+  44.4% to 21.9% against 21.8% observed. The calibrator is monotone, so the
+  score, the policy bands and the SHAP values are unchanged. It is calibrated
+  to the public training file, not to a Pakistani SME portfolio, and it is
+  ignored if it belongs to another training run.
+- **Hold-out evaluation.** The same script records the ROC curve, the
+  confusion matrix, a threshold table (score 30 to 70), reliability bins and
+  the default rate inside each policy band (Rejected 59.5%, Manual Review
+  14.6%, Approved 8.4%), all for the served model on the 6,517 hold-out loans.
+- `GET /model/evaluation` and `GET /model/comparison` serve those results and
+  the alternatives benchmark.
+- **Model Performance page** in the dashboard: ROC curve, calibration chart,
+  confusion matrix, threshold table, default rate by band, and the six-model
+  comparison with paired t-tests. The scoring result and the SHAP report show
+  the probability of default beside the score.
+
 ## [1.3.0] - 2026-09-29
 
 ### Added

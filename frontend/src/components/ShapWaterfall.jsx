@@ -14,7 +14,8 @@ import {
 
 import { apiErrorMessage, explainApplication } from "../api/client.js";
 import { formatPKRCompact } from "../lib/format.js";
-import { DecisionBadge } from "./common/Badges.jsx";
+import PathToApproval from "./PathToApproval.jsx";
+import { RecommendationBadge } from "./common/Badges.jsx";
 import { EmptyState, ErrorState, LoadingState } from "./common/States.jsx";
 
 const POSITIVE_COLOR = "#059669";
@@ -98,7 +99,7 @@ function ValueLabel({ x, y, width, height, value }) {
 /**
  * Horizontal SHAP contribution chart for one application.
  *
- * Contributions are additive: base value + every bar reconstructs the final
+ * Contributions are additive: the model reference baseline + every bar reconstructs the final
  * score, which is the identity the backend guarantees and asserts in tests.
  * Pass `explanation` to render a payload you already have, or `applicationId`
  * to fetch it from `POST /explain/{id}`.
@@ -181,8 +182,22 @@ export default function ShapWaterfall({
             Application #{explanation.application_id}
           </p>
         </div>
-        <div className="flex items-center gap-3">
-          <DecisionBadge decision={explanation.decision} />
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+          <RecommendationBadge decision={explanation.decision} prefix />
+          {explanation.probability_of_default !== null &&
+          explanation.probability_of_default !== undefined ? (
+            <div
+              className="text-right"
+              title="Display only: calibrated on the public training file's default rate, not on a Pakistani SME portfolio. The score and the bars use the raw model probability."
+            >
+              <p className="tabular text-2xl leading-none font-bold text-slate-900">
+                {(explanation.probability_of_default * 100).toFixed(1)}%
+              </p>
+              <p className="text-[11px] tracking-wide text-slate-500 uppercase">
+                Calibrated PD (display only)
+              </p>
+            </div>
+          ) : null}
           <div className="text-right">
             <p className="tabular text-2xl leading-none font-bold text-slate-900">
               {summary.score.toFixed(1)}
@@ -193,7 +208,11 @@ export default function ShapWaterfall({
       </div>
 
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <SummaryTile label="Base value" value={summary.base.toFixed(1)} />
+        <SummaryTile
+          label="Model reference baseline"
+          value={summary.base.toFixed(1)}
+          title="The score the model gives its SHAP reference sample. Not a portfolio average."
+        />
         <SummaryTile
           label="Positive impact"
           value={`+${summary.positive.toFixed(1)}`}
@@ -275,6 +294,8 @@ export default function ShapWaterfall({
         />
       </div>
 
+      <PathToApproval path={explanation.approval_path} />
+
       <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3">
         <p className="text-xs font-semibold tracking-wide text-slate-500 uppercase">
           Credit file narrative
@@ -320,7 +341,7 @@ function displayAdditiveSummary(baseValue, positiveTotal, negativeTotal, riskSco
   };
 }
 
-function SummaryTile({ label, value, tone, emphasis = false }) {
+function SummaryTile({ label, value, tone, emphasis = false, title }) {
   const toneClass =
     tone === "positive"
       ? "text-emerald-700"
@@ -330,6 +351,7 @@ function SummaryTile({ label, value, tone, emphasis = false }) {
 
   return (
     <div
+      title={title}
       className={`rounded-lg border px-3 py-2 ${
         emphasis ? "border-brand-200 bg-brand-50" : "border-slate-200 bg-white"
       }`}

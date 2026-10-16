@@ -1,10 +1,32 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
-import { apiErrorMessage, scoreApplication } from "../api/client.js";
-import { formatPKR, formatPKRCompact } from "../lib/format.js";
+import {
+  apiErrorMessage,
+  fetchFeatureContract,
+  scoreApplication,
+  summariseStatement,
+} from "../api/client.js";
+import { contractSummary, unusedFieldNames } from "../lib/featureContract.js";
+import { formatPKR, formatPKRCompact, formatPercent } from "../lib/format.js";
+import PathToApproval from "./PathToApproval.jsx";
 import ScoreDial from "./ScoreDial.jsx";
+import { useActivePolicy } from "../lib/useActivePolicy.js";
 import { Spinner } from "./common/States.jsx";
+
+/** Mirrors `BusinessSector` in backend/schemas.py. */
+const BUSINESS_SECTORS = [
+  "Retail",
+  "Wholesale & Trading",
+  "Manufacturing",
+  "Textile & Garments",
+  "Food & Hospitality",
+  "Agriculture & Livestock",
+  "Services",
+  "Transport & Logistics",
+  "Construction",
+  "Other",
+];
 
 /** Field definitions mirror the backend's Pydantic ranges exactly. */
 const FIELD_GROUPS = [
@@ -27,6 +49,53 @@ const FIELD_GROUPS = [
         placeholder: "e.g. Siddiqui Textiles (Faisalabad)",
         minLength: 2,
         maxLength: 160,
+      },
+      {
+        name: "business_sector",
+        label: "Business sector",
+        type: "select",
+        options: BUSINESS_SECTORS,
+        optional: true,
+        hint: "For portfolio reports only. The model does not read it.",
+      },
+      {
+        name: "contact_phone",
+        label: "Contact number",
+        type: "text",
+        optional: true,
+        placeholder: "e.g. +923001234567",
+        pattern: /^\+?[0-9]{10,15}$/,
+        patternHint: "Digits only, 10 to 15, with an optional + in front.",
+        hint: "For payment reminders. Optional.",
+      },
+      {
+        name: "borrower_public_id",
+        label: "Existing borrower",
+        type: "text",
+        optional: true,
+        placeholder: "e.g. BRW-000012",
+        pattern: /^BRW-[0-9]{6,}$/i,
+        patternHint: "A borrower reference looks like BRW-000012.",
+        uppercase: true,
+        hint: "Fill in for a repeat borrower. Leave empty for a new business.",
+      },
+      {
+        name: "borrower_identifier_type",
+        label: "Identifier type",
+        type: "select",
+        options: ["CNIC", "NTN"],
+        optional: true,
+        hint: "Optional. The model does not read it.",
+      },
+      {
+        name: "borrower_identifier",
+        label: "CNIC or NTN",
+        type: "text",
+        optional: true,
+        placeholder: "e.g. 35202-1234567-1",
+        pattern: /^[0-9][0-9 -]{5,22}[0-9]$/,
+        patternHint: "Digits, with optional dashes.",
+        hint: "Links repeat applications to the same borrower.",
       },
     ],
   },
@@ -148,6 +217,11 @@ const FIELD_GROUPS = [
 
 const ALL_FIELDS = FIELD_GROUPS.flatMap((group) => group.fields);
 
+// The trained 3-feature model's unused fields, used until the contract loads.
+const STATIC_UNUSED_FIELDS = ALL_FIELDS.filter((field) => field.unusedByModel).map(
+  (field) => field.name,
+);
+
 /**
  * In the training data the default rate jumps from 22% to 67% once a loan
  * exceeds 30% of gross annual income, and the model inherits that cliff
@@ -176,6 +250,7 @@ const SAMPLE_PROFILES = [
     values: {
       applicant_name: "Ayesha Siddiqui",
       business_name: "Siddiqui Textiles (Faisalabad)",
+      business_sector: "Textile & Garments",
       loan_amount_pkr: "2400000",
       tenure_months: "36",
       monthly_digital_payments: "3200000",
@@ -194,6 +269,7 @@ const SAMPLE_PROFILES = [
     values: {
       applicant_name: "Hina Raza",
       business_name: "Raza Kiryana Store (Lahore)",
+      business_sector: "Retail",
       loan_amount_pkr: "1200000",
       tenure_months: "24",
       monthly_digital_payments: "500000",
@@ -212,6 +288,7 @@ const SAMPLE_PROFILES = [
     values: {
       applicant_name: "Bilal Ahmed",
       business_name: "Ahmed Auto Spares (Karachi)",
+      business_sector: "Wholesale & Trading",
       loan_amount_pkr: "3000000",
       tenure_months: "12",
       monthly_digital_payments: "25000",
@@ -233,10 +310,15 @@ function validate(values) {
     const raw = String(values[field.name] ?? "").trim();
 
     if (!raw) {
-      errors[field.name] = "Required.";
+      if (!field.optional) errors[field.name] = "Required.";
       continue;
     }
+    if (field.type === "select") continue;
 
+    if (field.type === "text" && field.pattern) {
+      if (!field.pattern.test(raw)) errors[field.name] = field.patternHint;
+      continue;
+    }
     if (field.type === "text") {
       if (raw.length < field.minLength) {
         errors[field.name] = `At least ${field.minLength} characters.`;
@@ -258,14 +340,29 @@ function validate(values) {
     }
   }
 
+  // The API needs an identifier and its type together.
+  const hasType = Boolean(String(values.borrower_identifier_type ?? "").trim());
+  const hasNumber = Boolean(String(values.borrower_identifier ?? "").trim());
+  if (hasType && !hasNumber) errors.borrower_identifier = "Enter the number, or clear the type.";
+  if (hasNumber && !hasType) errors.borrower_identifier_type = "Choose CNIC or NTN.";
+
   return errors;
 }
+
+/** Fields the statement fills, and the summary key each one comes from. */
+const STATEMENT_FIELDS = {
+  monthly_digital_payments: "suggested_monthly_digital_payments",
+  cash_flow_proxy: "suggested_cash_flow_proxy",
+  order_consistency: "suggested_order_consistency",
+};
 
 function toPayload(values) {
   const payload = {};
   for (const field of ALL_FIELDS) {
-    const raw = String(values[field.name]).trim();
-    payload[field.name] = field.type === "number" ? Number(raw) : raw;
+    const raw = String(values[field.name] ?? "").trim();
+    if (!raw && field.optional) continue;
+    payload[field.name] =
+      field.type === "number" ? Number(raw) : field.uppercase ? raw.toUpperCase() : raw;
   }
   return payload;
 }
@@ -278,11 +375,29 @@ function toPayload(values) {
  */
 export default function ApplicationForm({ onScored }) {
   const navigate = useNavigate();
+  // Before an assessment the dial shows the policy in force; afterwards the
+  // assessment's own policy snapshot, which is what its recommendation used.
+  const activePolicy = useActivePolicy();
   const [values, setValues] = useState(EMPTY_FORM);
   const [errors, setErrors] = useState({});
   const [submitError, setSubmitError] = useState(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [result, setResult] = useState(null);
+  const [statement, setStatement] = useState(null);
+  const [statementError, setStatementError] = useState(null);
+  // Which fields the model serving now actually reads (GET /model/feature-contract).
+  const [contract, setContract] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    fetchFeatureContract()
+      .then((value) => alive && setContract(value))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
+  const unusedFields = unusedFieldNames(contract, STATIC_UNUSED_FIELDS);
+  const contractLine = contractSummary(contract);
   const turnoverRatio = facilityToTurnover(values);
   const fieldNotes = {
     loan_amount_pkr:
@@ -306,9 +421,37 @@ export default function ApplicationForm({ onScored }) {
     setValues(sample.values);
     setErrors({});
     setSubmitError(null);
+    setStatement(null);
+  };
+
+  // Read the chosen CSV in the browser, let the API summarise it, and fill the
+  // turnover fields. The same text is sent again with the application, so the
+  // API can store what the statement really shows.
+  const handleStatement = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    setStatementError(null);
+    try {
+      const csv = await file.text();
+      const summary = await summariseStatement(csv);
+      setStatement({ csv, summary, fileName: file.name });
+      setValues((previous) => ({
+        ...previous,
+        ...Object.fromEntries(
+          Object.entries(STATEMENT_FIELDS).map(([name, key]) => [name, String(summary[key])]),
+        ),
+      }));
+      setErrors({});
+    } catch (error) {
+      setStatement(null);
+      setStatementError(apiErrorMessage(error, "The statement could not be read."));
+    }
   };
 
   const handleReset = () => {
+    setStatement(null);
+    setStatementError(null);
     setValues(EMPTY_FORM);
     setErrors({});
     setSubmitError(null);
@@ -327,7 +470,10 @@ export default function ApplicationForm({ onScored }) {
     setIsSubmitting(true);
     setSubmitError(null);
     try {
-      const scored = await scoreApplication(toPayload(values));
+      const scored = await scoreApplication({
+        ...toPayload(values),
+        ...(statement ? { statement_csv: statement.csv } : {}),
+      });
       setResult(scored);
       onScored?.(scored);
     } catch (error) {
@@ -363,6 +509,18 @@ export default function ApplicationForm({ onScored }) {
         </div>
 
         <div className="space-y-7 px-5 py-5">
+          <StatementBox
+            statement={statement}
+            error={statementError}
+            values={values}
+            onPick={handleStatement}
+            onRemove={() => setStatement(null)}
+          />
+          {contractLine ? (
+            <p className="rounded-md bg-slate-50 px-3 py-2 text-xs text-slate-600" data-testid="feature-contract">
+              {contractLine}
+            </p>
+          ) : null}
           {FIELD_GROUPS.map((group) => (
             <fieldset key={group.title} className="space-y-4">
               <legend className="text-sm font-semibold text-slate-900">
@@ -377,6 +535,7 @@ export default function ApplicationForm({ onScored }) {
                     value={values[field.name]}
                     error={errors[field.name]}
                     note={fieldNotes[field.name]}
+                    unused={unusedFields.has(field.name)}
                     onChange={handleChange}
                   />
                 ))}
@@ -429,6 +588,7 @@ export default function ApplicationForm({ onScored }) {
             score={result ? result.risk_score : null}
             decision={result?.decision}
             riskBand={result?.risk_band}
+            bands={result ? result.policy?.bands : activePolicy}
             size={260}
           />
 
@@ -445,6 +605,13 @@ export default function ApplicationForm({ onScored }) {
                   label="Monthly installment"
                   value={formatPKR(result.monthly_installment_pkr)}
                 />
+                {result.probability_of_default !== null &&
+                result.probability_of_default !== undefined ? (
+                  <ResultRow
+                    label="Calibrated PD (display only)"
+                    value={formatPercent(result.probability_of_default)}
+                  />
+                ) : null}
               </dl>
 
               {result.explanation ? (
@@ -458,6 +625,8 @@ export default function ApplicationForm({ onScored }) {
                 </div>
               ) : null}
 
+              <PathToApproval path={result.explanation?.approval_path} compact />
+
               <button
                 type="button"
                 className="btn-primary w-full"
@@ -468,8 +637,8 @@ export default function ApplicationForm({ onScored }) {
             </div>
           ) : (
             <p className="mt-6 text-center text-sm text-slate-500">
-              Complete the form to generate a score, a decision and an explainable
-              rationale.
+              Complete the form to get a Risk Assessment, a ForiFlow Recommendation and an
+              explainable rationale. The Credit Officer Decision comes after.
             </p>
           )}
         </div>
@@ -478,7 +647,76 @@ export default function ApplicationForm({ onScored }) {
   );
 }
 
-function FormField({ field, value, error, note, onChange }) {
+/**
+ * Fill the turnover fields from a wallet or bank statement instead of typing
+ * them. Shows what the statement says and whether the form still matches it.
+ */
+function StatementBox({ statement, error, values, onPick, onRemove }) {
+  const summary = statement?.summary;
+  const edited =
+    summary &&
+    ["monthly_digital_payments", "cash_flow_proxy"].some(
+      (name) => Number(values[name]) !== summary[STATEMENT_FIELDS[name]],
+    );
+
+  return (
+    <div className="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <p className="text-sm font-semibold text-slate-900">Fill turnover from a statement</p>
+          <p className="text-xs text-slate-500">
+            A CSV export of the applicant's wallet or bank account, at least 3 full months.
+            It replaces typing the turnover, which drives most of the score.
+          </p>
+        </div>
+        <label className="btn-secondary cursor-pointer px-3 py-1.5 text-xs">
+          {statement ? "Choose another file" : "Choose CSV file"}
+          <input type="file" accept=".csv,text/csv" className="sr-only" onChange={onPick} />
+        </label>
+      </div>
+
+      {error ? (
+        <p role="alert" className="mt-2 text-xs font-medium text-rose-700">
+          {error}
+        </p>
+      ) : null}
+
+      {summary ? (
+        <div className="mt-3 border-t border-slate-200 pt-3 text-xs text-slate-700">
+          <p>
+            <span className="font-semibold text-slate-900">{statement.fileName}</span>:{" "}
+            {summary.full_months} full months, {summary.transactions.toLocaleString("en-PK")}{" "}
+            transactions, {summary.period_start} to {summary.period_end}.
+          </p>
+          <p className="tabular mt-1">
+            Median money in per month {formatPKR(summary.monthly_inflow_median)} · median net{" "}
+            {formatPKR(summary.monthly_net_median)} · monthly spread{" "}
+            {(summary.inflow_variation * 100).toFixed(0)}% of the average.
+          </p>
+          {summary.warnings.map((warning) => (
+            <p key={warning} className="mt-1 font-medium text-amber-800">
+              Check: {warning}
+            </p>
+          ))}
+          <p className={`mt-1 font-medium ${edited ? "text-amber-800" : "text-brand-700"}`}>
+            {edited
+              ? "The turnover fields no longer match the statement. The credit file will say so."
+              : "Digital payments, cash flow and order consistency are filled from this file."}
+          </p>
+          <button
+            type="button"
+            onClick={onRemove}
+            className="mt-1 text-xs font-semibold text-slate-500 underline hover:text-slate-700"
+          >
+            Remove statement
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function FormField({ field, value, error, note, unused, onChange }) {
   const showCurrencyHint = field.currency && value !== "" && !Number.isNaN(Number(value));
 
   return (
@@ -489,20 +727,37 @@ function FormField({ field, value, error, note, onChange }) {
           <span className="ml-1 text-xs font-normal text-slate-400">(PKR)</span>
         ) : null}
       </label>
-      <input
-        id={field.name}
-        name={field.name}
-        type={field.type}
-        value={value}
-        onChange={onChange}
-        placeholder={field.placeholder}
-        min={field.min}
-        max={field.max}
-        step={field.step}
-        aria-invalid={Boolean(error)}
-        aria-describedby={error ? `${field.name}-error` : undefined}
-        className={`field-input ${error ? "field-input-error" : ""}`}
-      />
+      {field.type === "select" ? (
+        <select
+          id={field.name}
+          name={field.name}
+          value={value ?? ""}
+          onChange={onChange}
+          className="field-input"
+        >
+          <option value="">Not recorded</option>
+          {field.options.map((option) => (
+            <option key={option} value={option}>
+              {option}
+            </option>
+          ))}
+        </select>
+      ) : (
+        <input
+          id={field.name}
+          name={field.name}
+          type={field.type}
+          value={value}
+          onChange={onChange}
+          placeholder={field.placeholder}
+          min={field.min}
+          max={field.max}
+          step={field.step}
+          aria-invalid={Boolean(error)}
+          aria-describedby={error ? `${field.name}-error` : undefined}
+          className={`field-input ${error ? "field-input-error" : ""}`}
+        />
+      )}
       {error ? (
         <p id={`${field.name}-error`} className="mt-1 text-xs font-medium text-rose-600">
           {error}
@@ -517,12 +772,13 @@ function FormField({ field, value, error, note, onChange }) {
           {note}
         </p>
       ) : null}
-      {field.unusedByModel ? (
+      {unused ? (
         <p
           className="mt-1 text-xs font-semibold text-amber-800"
-          title="Collected for future scoring versions — not currently used in this risk score."
+          title="Recorded on the credit file. The model serving now does not read it, so it does not change the score."
+          data-unused-field={field.name}
         >
-          Collected for future scoring versions — not currently used in this risk score.
+          Recorded, not used by the current model — does not change this score.
         </p>
       ) : null}
     </div>

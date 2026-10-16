@@ -3,31 +3,49 @@
 Base URL in Docker and local Vite: `http://localhost:3000/api` (nginx / Vite
 strip `/api` before FastAPI). Direct access: `http://localhost:8000`.
 
-Interactive docs: [http://localhost:8000/docs](http://localhost:8000/docs).
+Interactive docs: [http://localhost:8000/docs](http://localhost:8000/docs) in
+development mode. Since 2.3 production mode (the Docker stack) turns `/docs`,
+`/redoc` and `/openapi.json` off, and since 2.3.1 they stay off even with `FORIFLOW_ENABLE_DOCS=true`. Security
+behaviour in full: [SECURITY.md](../SECURITY.md).
 
 All amounts are PKR. Timestamps are UTC ISO-8601.
 
 ## Authentication and roles
 
-`GET /`, `GET /health`, `POST /auth/login` and the interactive docs are public.
-Every other route needs `Authorization: Bearer <token>`; a missing, expired or
-invalid token returns `401`.
+Three roles, each including the one below: `analyst`, `manager`, `admin`.
 
-Two roles exist. The role is read from the `users` table on every request, not
-from the token, so changing a user's role takes effect immediately.
+`GET /`, `GET /health`, `GET /health/live`, `GET /health/ready`,
+`POST /auth/login` and (when enabled) the interactive docs are public. Every
+other route needs `Authorization: Bearer <token>`; a missing, malformed,
+expired, signed-out or pre-2.3 token, or one for a disabled account, returns
+`401 Not authenticated`.
 
-| Action | `analyst` | `admin` |
-| --- | --- | --- |
-| Score, explain, list applications | yes | yes |
-| Record EWS observations, read alerts and history | yes | yes |
-| Take an EWS alert for review | yes | yes |
-| Approve or reject a Manual Review application | no (`403`) | yes |
-| Resolve an EWS alert | no (`403`) | yes |
-| List or create officer accounts | no (`403`) | yes |
+The role is read from the `users` table on every request, not from the token,
+so changing a user's role takes effect immediately.
+
+| Action | `analyst` | `manager` | `admin` |
+| --- | --- | --- | --- |
+| Score, explain, list applications | yes | yes | yes |
+| Record EWS observations, read alerts, reminders and history | yes | yes | yes |
+| Take an EWS alert for review | yes | yes | yes |
+| Reject an application | no (`403`) | yes | yes |
+| Approve an application | no (`403`) | up to the policy's manager limit; not against a Decline recommendation | yes |
+| Escalate an application to an admin | no (`403`) | yes | not applicable |
+| Decide an escalated application | no (`403`) | no (`403`) | yes |
+| Create or activate a credit policy version | no (`403`) | no (`403`) | yes |
+| Resolve an EWS alert | no (`403`) | yes | yes |
+| List, create, disable or re-enable officer accounts | no (`403`) | no (`403`) | yes |
+| Read the audit trail | no (`403`) | no (`403`) | yes |
 
 The API refuses to sign tokens while `JWT_SECRET_KEY` is empty, shorter than 32
-characters, or still the `.env.example` placeholder (login returns `500` and
-the startup log names the problem).
+characters, or still the `.env.example` placeholder; in production mode it
+refuses to start (the log names the setting, never its value).
+
+Every response carries security headers (`Content-Security-Policy`,
+`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`,
+`Cache-Control: no-store`, …). Bodies over 3 MiB get `413`. An unexpected
+error is `500 {"detail": "Internal server error…", "request_id": "…"}` with no
+traceback.
 
 ### POST `/auth/login`
 
@@ -36,11 +54,24 @@ the startup log names the problem).
 ```
 
 **Response `200`**: `access_token`, `token_type` (`bearer`), `expires_in`
-(28800 seconds), `username`, `role`. Wrong credentials return `401`.
+(28800 seconds by default; `FORIFLOW_JWT_EXPIRE_MINUTES`), `username`, `role`.
+The token carries `sub`, `role`, `iat`, `exp`, `iss` (`foriflow`) and a random
+`jti`.
+
+| Status | When |
+| --- | --- |
+| `401 Incorrect username or password` | Unknown username or wrong password (one message for both). |
+| `403` | Correct password, but the account is disabled. |
+| `429` + `Retry-After` | 5 wrong passwords for this username within 15 minutes (locked 15 minutes, also for unknown usernames), or more than 30 sign-in requests in 5 minutes from one address. |
+
+### POST `/auth/logout` (2.3)
+
+Revokes the token used for the request (its `jti`) until it would have
+expired. Other sessions of the same officer are unaffected. **Response `204`**.
 
 ### GET `/auth/me`
 
-The signed-in account: `id`, `username`, `role`, `created_at`.
+The signed-in account: `id`, `username`, `role`, `created_at`, `is_active`.
 
 ### GET `/auth/users` (admin)
 
@@ -54,8 +85,21 @@ All officer accounts, oldest first. Password hashes are never returned.
 
 `role` defaults to `analyst`. Usernames are 3–64 characters of letters, digits,
 `.`, `_` or `-`. Passwords are 12–72 characters and may not be the
-`.env.example` placeholder (`422`). An existing username returns `409`.
+`.env.example` placeholder, a common password, a keyboard or number sequence,
+fewer than 5 different characters, or contain the username (`422`, the
+password is never echoed). An existing username returns `409`.
 **Response `201`**: the new account, as in `GET /auth/me`.
+
+### PATCH `/auth/users/{id}/status` (admin, 2.3)
+
+```json
+{ "is_active": false, "reason": "Left the branch." }
+```
+
+Disables or re-enables an account. A disabled account's tokens stop working
+on the next request and it cannot sign in; nothing is deleted. `409` when an
+admin tries to disable their own account or the last enabled admin; `404` for
+an unknown id. Audited as `user.disabled` / `user.enabled` with the reason.
 
 ## GET `/`
 
@@ -66,16 +110,19 @@ Service metadata.
 ```json
 {
   "service": "ForiFlow API",
-  "version": "1.3.0",
+  "version": "2.3.0",
   "docs": "/docs",
   "endpoints": ["/auth/login", "/score", "/score/applications", "/score/stats",
-                "/explain/{application_id}", "/ews/monitor", "/ews/alerts"]
+                "/explain/{application_id}", "/ews/monitor", "/ews/alerts",
+                "/borrowers", "/borrowers/{borrower_ref}/history", "…"]
 }
 ```
 
 ## GET `/health`
 
-Liveness and database connectivity. The dashboard polls this every 60 seconds.
+Status summary and database connectivity; always `200` while the process
+runs. The dashboard polls this every 60 seconds. `docs` in `GET /` is `null`
+when the interactive docs are off.
 
 **Response `200`**
 
@@ -83,10 +130,42 @@ Liveness and database connectivity. The dashboard polls this every 60 seconds.
 {
   "status": "ok",
   "service": "ForiFlow API",
-  "version": "1.3.0",
-  "database": "connected"
+  "version": "2.3.0",
+  "database": "connected",
+  "scoring_engine": "ml",
+  "model_version": "ensemble-xgb-rf-credit_risk_shared-2026-09-25T10:38:26",
+  "scoring_fallback_reason": null
 }
 ```
+
+`scoring_engine` is `ml` (trained ensemble) or `surrogate` (fallback formula).
+When it is `surrogate`, `scoring_fallback_reason` says why: `pinned`,
+`artifacts_missing` or `load_failed`.
+
+Every response carries an `X-Request-ID` header. The same id is stored on the
+audit entries that request wrote.
+
+## GET `/health/live` and GET `/health/ready` (2.3)
+
+`/health/live` returns `200 {"status": "alive"}` while the process runs.
+`/health/ready` returns `200` when the database answers, the trained model is
+serving (or the fallback was pinned) and the configuration is safe, and `503`
+otherwise; each check is named with a short reason, never a value:
+
+```json
+{
+  "status": "ready",
+  "version": "2.3.0",
+  "environment": "production",
+  "checks": [
+    {"name": "database", "ok": true, "detail": "reachable"},
+    {"name": "model", "ok": true, "detail": "ml engine serving"},
+    {"name": "configuration", "ok": true, "detail": "loaded"}
+  ]
+}
+```
+
+The Docker healthcheck uses `/health/ready`.
 
 ## POST `/score`
 
@@ -128,6 +207,7 @@ Query: `include_explanation` (default `true`).
   "decision": "Manual Review",
   "risk_band": "Medium Risk",
   "confidence": 43.7,
+  "probability_of_default": 0.0888,
   "model_version": "ensemble-xgb-rf-credit_risk_shared-2026-09-25T10:38:26",
   "explanation": {
     "application_id": 1,
@@ -169,7 +249,7 @@ Query: `include_explanation` (default `true`).
     ],
     "top_negative_factors": [],
     "narrative": "Score 67.2/100 (Medium Risk) resulted in a 'Manual Review' outcome. Supporting factors: facility size vs annual turnover (+10.8), years in operation (+5.1), repayment history (officer-entered) (+4.2). Referred to a credit officer for manual verification of cash flow evidence.",
-    "compliance_note": "SHAP values are stored on-premise so a bank can support an SBP-oriented adverse-action file. Payment-history and bureau-balance fields are officer-entered; there is no live ECIB or other bureau connector. All amounts are in PKR. ForiFlow is not SBP-certified. Scored by the trained XGBoost + RandomForest ensemble (credit_risk_shared dataset, 5-fold CV 0.7752 ± 0.0073, hold-out 0.7731 (n=32,581, 3 features, trained on a public/proxy dataset — not a real SME portfolio) with TreeSHAP attributions. Payment history is read as a clean (above 52.5) or adverse (52.5 and below) record, not as a fine scale. Collected but not used by this model version: Business size (employees), Existing debt burden, Installment affordability vs cash flow, Inventory turnover, Order consistency.",
+    "compliance_note": "SHAP values are stored on-premise so a bank can support an SBP-oriented adverse-action file. Payment-history and bureau-balance fields are officer-entered; there is no live ECIB or other bureau connector. All amounts are in PKR. ForiFlow is not SBP-certified. Scored by the trained XGBoost + RandomForest ensemble (credit_risk_shared dataset, 5-fold CV on the training split 0.7743 ± 0.0073, final test 0.7748 (n=32,416, 3 features, trained on a public/proxy dataset — not a real SME portfolio) with TreeSHAP attributions. This is a demonstration model trained on public consumer credit data; it is not validated for Pakistani SME lending and must not be used for autonomous credit decisions. Payment history is read as a clean (above 52.5) or adverse (52.5 and below) record, not as a fine scale. The probability of default shown is calibrated (display only) to the 21.9% default rate of that public file, not to a Pakistani SME portfolio; the score and SHAP use the raw model probability. Collected but not used by this model version: Business size (employees), Existing debt burden, Installment affordability vs cash flow, Inventory turnover, Order consistency.",
     "model_version": "ensemble-xgb-rf-credit_risk_shared-2026-09-25T10:38:26"
   },
   "created_at": "2026-09-25T10:47:02.821460+05:00",
@@ -180,15 +260,34 @@ Query: `include_explanation` (default `true`).
 **Errors:** `422` on field-range violations (see `SMEApplicant` in
 `backend/schemas.py`).
 
+### Borrower and model fields (1.10.0)
+
+Optional request fields on `POST /score`:
+
+| Field | Meaning |
+|---|---|
+| `borrower_public_id` | File under an existing borrower, e.g. `BRW-000012`. Unknown: `404`. Inactive: `409`. |
+| `borrower_identifier_type`, `borrower_identifier` | `CNIC` (13 digits) or `NTN` (7 or 8). Given together; dashes ignored. Finds the borrower holding it, or is stored on the new one. |
+
+With neither, a new borrower is opened from the application's own details. A
+matching name never links two applications.
+
+Added to the response, and to every application in `GET /score/applications`:
+`borrower_id`, `borrower_public_id`, `model_version`, `scoring_engine`
+(`ml` or `surrogate`). `POST /score` also returns `borrower_created`.
+`model_version` and `scoring_engine` are stored with the application and do
+not change when the served model changes. They are `null` only for an
+application scored before 1.10 whose stored explanation named no model.
+
 ## GET `/score/applications`
 
 List scored applications, newest first.
 
-Query: `decision` (the model's band: `Rejected` | `Manual Review` | `Approved`),
-`final_decision` (the decision that stands: `Approved` | `Rejected`, i.e. the
-model's band or the officer's call on a Manual Review case), `pending_review`
-(`true`: Manual Review cases still awaiting an officer decision; `false`: every
-other row), `limit` (1–200, default 50), `offset`.
+Query: `decision` (the policy recommendation, legacy wording: `Rejected` |
+`Manual Review` | `Approved`), `final_decision` (the officer's decision:
+`Approved` | `Rejected`), `pending_review` (`true`: still awaiting an officer
+decision; `false`: every other row), `decision_status`, `limit` (1–200,
+default 50), `offset`. See "Model, policy, human (2.0.0)" below.
 
 **Response `200`**
 
@@ -217,7 +316,12 @@ other row), `limit` (1–200, default 50), `offset`.
 stands: the model's band for Approved and Rejected, the officer's
 `review_decision` for a reviewed Manual Review case, and `null` while that
 review is pending. `scored_by` is `null` for rows scored before migration
-`0003_officer_decisions` (version 1.3.0).
+`0003_officer_decisions` (version 1.3.0). `business_sector` is `null` when the
+officer did not record one, and for every row from before
+`0004_portfolio_fields` (version 1.5.0).
+
+Since 2.3 `contact_phone` is masked in this list (all but the last three
+digits); `GET /score/applications/{id}` returns it in full.
 
 ## GET `/score/stats`
 
@@ -256,9 +360,11 @@ is counted once; the edges 40 and 70 are the policy boundaries.
 
 `GET /score/applications/{id}` returns one row or `404`.
 
-## POST `/score/applications/{id}/review` (admin)
+## POST `/score/applications/{id}/review` (manager or admin)
 
-Record the final decision on a Manual Review application, with the reason.
+The pre-2.0 name of `POST /score/applications/{id}/decision`, kept working.
+Since 2.0 it records the officer's decision on **any** application, and also
+accepts `Escalated`. See "Model, policy, human (2.0.0)" below.
 
 ```json
 { "decision": "Approved", "note": "Five years of clean POS receipts; facility is 28% of turnover." }
@@ -267,6 +373,11 @@ Record the final decision on a Manual Review application, with the reason.
 `decision` is `Approved` or `Rejected`; `note` is 10–1000 characters.
 **Response `200`**: the application, as in `GET /score/applications/{id}`,
 with `review_decision`, `review_note`, `reviewed_by` and `reviewed_at` set.
+
+A manager approving a facility above the policy's manager limit (2,000,000 in
+the demo policy) gets `403`; an admin must approve it. A manager may reject at any
+size. Each application reports `approval_authority` (`manager` or `admin`) and
+`manager_approval_limit_pkr`.
 
 **Errors:** `404` unknown id; `409` if the model's band is Approved or
 Rejected (only Manual Review needs an officer decision) or if a decision is
@@ -288,43 +399,38 @@ none is stored).
 
 `GET /explain/{application_id}` is the read-only twin.
 
-## POST `/ews/monitor`
+## Early Warning System (2.1)
 
-Record one month of post-disbursement surveillance. Triggers an alert when the
-monthly score drops more than 15 points from the originating application.
+Method, thresholds and limits: [docs/ews.md](ews.md). The EWS is rule- and
+trend-based, not a default-prediction model; it recommends and never changes a
+facility or a credit decision. Every route needs a signed-in officer.
 
-**Request**
+### POST `/ews/observations` (also `POST /ews/monitor`)
+
+Record one month for an approved facility. Any officer.
 
 ```json
 {
   "borrower_id": 1,
   "month_number": 4,
+  "observation_date": "2026-10-05",
   "installment_status": "Late 30-59",
+  "days_late": 34,
   "bureau_balance": 1650000,
   "pos_cash_balance": 240000,
+  "amount_paid_pkr": 50000,
   "data_source_primary": "ECIB"
 }
 ```
 
-`installment_status`: `On Time`, `Late 1-29`, `Late 30-59`, `Late 60-89`,
-`Default`. `data_source_primary`: `ECIB`, `POS`, `Bank Statement`,
-`Self Reported`.
+`borrower_id` is the facility: the id of the approved application.
+`observation_date` defaults to today and cannot be in the future or before the
+application. `days_late` is optional and must fit the bucket. To override the
+monitored score add `current_score` and `override_reason` (10-1000
+characters); this needs a manager or admin (`403` otherwise, and the refusal
+is audited).
 
-`borrower_id` is an application id. An unknown id returns `404`. Only an
-approved application became a facility, so only it can be monitored: Approved
-by the model, or Manual Review and then approved by an officer. Anything else
-returns `409`: a model Rejected application, a Manual Review case still
-awaiting its decision, or one an officer rejected. `month_number` cannot be
-past the facility's `tenure_months` (`422`).
-
-The alert follows the latest month on file. A new latest month that drops more
-than 15 points opens an alert, or updates the open one. Back-filling an older
-month never changes the alert (the response says so in `recommended_action`).
-If the latest month is corrected and no longer breaches, the open alert is
-closed with an automatic note. The example below assumes application 1 was
-approved first.
-
-**Response `201`**
+**`201`**
 
 ```json
 {
@@ -333,85 +439,467 @@ approved first.
   "month_number": 4,
   "baseline_score": 67.23,
   "current_score": 47.01,
+  "score_source": "ews_rule_adjusted",
   "score_drop": 20.22,
   "alert_triggered": true,
   "alert_threshold": 15.0,
-  "estimated_days_to_default": 74,
-  "recommended_action": "Relationship manager to contact the borrower within 7 days and verify POS settlement trends.",
-  "tracking": {
-    "id": 1,
-    "borrower_id": 1,
-    "month_number": 4,
-    "installment_status": "Late 30-59",
-    "bureau_balance": 1650000.0,
-    "pos_cash_balance": 240000.0,
-    "monthly_score": 47.01,
-    "data_source_primary": "ECIB"
-  },
-  "alert": {
-    "id": 1,
-    "borrower_id": 1,
-    "baseline_score": 67.23,
-    "current_score": 47.01,
-    "score_drop": 20.22,
-    "estimated_days_to_default": 74,
-    "alert_status": "Active",
-    "triggered_at": "2026-09-25T10:47:16.580236+05:00",
-    "resolved_at": null,
-    "business_name": "Siddiqui Textiles (Faisalabad)",
-    "assigned_to": null,
-    "resolved_by": null,
-    "resolution_note": null
-  }
+  "ews_state": "WARNING",
+  "state_reasons": ["Score is 20.22 points below baseline (warning above 15).", "Latest month is Late 30-59."],
+  "signals": [
+    {"code": "PAYMENT_DELAY_INCREASED", "label": "Payment delay increased",
+     "evidence": "Repayment moved from On Time (month 3) to Late 30-59 (month 4), 34 days late.",
+     "values": {"previous_status": "On Time", "current_status": "Late 30-59"}}
+  ],
+  "trend": {"facility_id": 1, "baseline_score": 67.23, "latest_score": 47.01, "previous_score": 66.1,
+            "total_deterioration": 20.22, "recent_deterioration": 19.09,
+            "slope_points_per_month": -5.2, "direction": "Deteriorating",
+            "observations": 4, "min_observations": 3, "message": null,
+            "points": [{"label": "Baseline", "month_number": 0, "score": 67.23, "score_source": "origination_assessment"}]},
+  "recommended_actions": ["Relationship manager to contact the borrower within 7 days.", "..."],
+  "recommended_action": "Relationship manager to contact the borrower within 7 days.",
+  "estimated_days_to_default": 160,
+  "default_probability_3m": 0.0266,
+  "runway_basis": "markov",
+  "tracking": {"id": 4, "month_number": 4, "score_source": "ews_rule_adjusted",
+               "score_source_label": "EWS rules applied to the ForiFlow origination assessment",
+               "rule_score": 47.01, "record_status": "active", "created_by": "zakria", "...": "..."},
+  "alert": {"id": 1, "severity": "WARNING", "alert_status": "Open",
+            "reason_codes": ["PAYMENT_DELAY_INCREASED", "RISK_SCORE_DECLINED", "..."], "...": "..."}
 }
 ```
 
-**Errors:** `404` if `borrower_id` is not a scored application; `409` if it is
-not an approved facility; `422` for a month past the tenure or out-of-range
-fields.
+`default_probability_3m` is reference only (a Markov chain fitted on consumer
+card accounts, not SME loans) and never raises an alert.
+`estimated_days_to_default` is a heuristic kept for compatibility.
 
-## GET `/ews/alerts`
+**Errors:** `404` unknown application; `409` not an approved facility, or the
+month is already recorded (the message names the correction route); `422`
+past the tenure, a bad date, `days_late` outside the bucket, or a
+`current_score` without a reason.
 
-Officer alert queue.
+**Changed in 2.1:** a recorded month used to be overwritten by a second
+submission; it is now refused. `current_score` used to be accepted from any
+officer without a reason.
 
-Query: `alert_status` (`Active` | `In Review` | `Resolved`), `limit`, `offset`.
+### POST `/ews/observations/{id}/correct` (manager or admin)
 
-**Response `200`**
+The same fields without `borrower_id` and `month_number`, plus
+`correction_reason` (10-1000 characters). Adds a corrected row for the same
+month; the original keeps its figures and becomes `superseded`. `409` if it
+was already corrected. Returns the same body as above.
+
+### GET `/ews/facilities/{id}/observations`
+
+Every recorded month, oldest first, corrections included (`record_status`,
+`supersedes_observation_id`, `superseded_by_observation_id`,
+`correction_reason`). `?include_superseded=false` for the active rows only.
+`GET /ews/borrowers/{id}/history` (pre-2.1) returns the active rows.
+
+### GET `/ews/facilities/{id}/trend`
+
+Baseline, latest, previous, total and recent deterioration, OLS slope,
+direction (`Improving`, `Stable`, `Deteriorating`, `Insufficient Data`), and
+`points` for the chart: `Baseline` (month 0) then each active month with its
+`score_source`. `message` is "Insufficient history for multi-month trend"
+below three observations.
+
+### GET `/ews/facilities/{id}/state`
+
+`state` (`NORMAL`, `WATCH`, `WARNING`, `CRITICAL`), `state_reasons`,
+`signals`, `recommended_actions`, `trend`, `latest_observation`,
+`open_alert`.
+
+### GET `/ews/facilities/{id}/timeline`
+
+Stored events, oldest first: audit-trail entries for the application, its
+observations and its alerts (`source: "audit_log"`), plus rows from before the
+audit trail (`source: "record"`, time as stored or null).
+
+### GET `/ews/overview`
+
+`monitored_facilities`, `state_counts`, `open_alerts`, `overdue_actions`, one
+row per monitored facility (baseline, current, deteriorations, trend, state,
+active alerts, last observation), worst first, and `methodology`.
+
+### GET `/ews/methodology`
+
+The thresholds the engine uses and the caveats. The dashboard reads these.
+
+### GET `/ews/alerts`
+
+Query: `alert_status` (`Open`, `Acknowledged`, `Action Required`, `Resolved`,
+`Dismissed`), `severity` (`WARNING`, `CRITICAL`), `facility_id`, `open_only`,
+`limit`, `offset`. Open alerts first, then severity and drop. Closed alerts
+stay listed.
 
 ```json
-[
-  {
-    "id": 1,
-    "borrower_id": 1,
-    "baseline_score": 67.23,
-    "current_score": 47.01,
-    "score_drop": 20.22,
-    "estimated_days_to_default": 74,
-    "alert_status": "Active",
-    "triggered_at": "2026-09-25T10:47:16.580236+05:00",
-    "resolved_at": null,
-    "business_name": "Siddiqui Textiles (Faisalabad)",
-    "assigned_to": null,
-    "resolved_by": null,
-    "resolution_note": null
-  }
-]
+{
+  "id": 1, "borrower_id": 1, "business_name": "Siddiqui Textiles (Faisalabad)",
+  "severity": "WARNING", "reason_codes": ["PAYMENT_DELAY_INCREASED", "RISK_SCORE_DECLINED", "MULTIPLE_NEGATIVE_SIGNALS"],
+  "evidence": [{"kind": "signal", "code": "RISK_SCORE_DECLINED", "label": "...", "evidence": "...", "values": {}},
+               {"kind": "state_rule", "code": null, "label": "WARNING rule", "evidence": "Latest month is Late 30-59.", "values": {}}],
+  "recommended_actions": ["..."],
+  "baseline_score": 67.23, "previous_score": 66.1, "current_score": 47.01, "score_drop": 20.22,
+  "estimated_days_to_default": 160, "alert_status": "Acknowledged",
+  "triggered_at": "2026-10-05T10:47:16+05:00", "observation_id": 4, "last_observation_id": 4,
+  "acknowledged_at": "2026-10-05T11:02:00+05:00", "acknowledged_by": "manager1",
+  "assigned_to": "zakria", "assigned_at": "...", "assigned_by": "manager1",
+  "action_due_date": "2026-10-12", "action_note": null,
+  "resolved_at": null, "resolved_by": null, "resolution_note": null,
+  "is_open": true, "is_overdue": false, "is_legacy": false
+}
 ```
 
-Related: `GET /ews/borrowers/{id}/history`.
+Alerts raised before 2.1 have `severity`, `reason_codes` and `evidence` null
+and `is_legacy: true`.
 
-## PATCH `/ews/alerts/{id}/review`
+### GET `/ews/alerts/{id}` and `/ews/alerts/{id}/history`
 
-Any officer takes an open alert for review: `alert_status` becomes
-`In Review` and `assigned_to` records who. `404` unknown id, `409` if the
-alert is already resolved or is being reviewed by another officer.
+One alert, and its audit entries oldest first.
 
-## PATCH `/ews/alerts/{id}/resolve` (admin)
+### Alert lifecycle (manager or admin)
+
+| Route | Body | From |
+|---|---|---|
+| `POST /ews/alerts/{id}/acknowledge` | `{"note": "optional"}` | Open |
+| `POST /ews/alerts/{id}/assign` | `{"assigned_to": "zakria", "due_date": "2026-10-12", "note": "optional"}` | any open status |
+| `POST /ews/alerts/{id}/due-date` | `{"due_date": "2026-10-12"}` | any open status |
+| `POST /ews/alerts/{id}/action-required` | `{"action_note": "...", "assigned_to": "optional", "due_date": "optional"}` | Acknowledged |
+| `POST /ews/alerts/{id}/resolve` (also `PATCH`) | `{"note": "5-1000 characters"}` | any open status |
+| `POST /ews/alerts/{id}/dismiss` | `{"note": "5-1000 characters"}` | any open status |
+| `PATCH /ews/alerts/{id}/review` (pre-2.1) | none | acknowledge and assign to yourself |
+
+`403` for analysts; `404` unknown alert; `409` for a step not allowed from the
+current status (a closed alert never reopens); `422` for an unknown assignee
+or a past due date. Every step is audited.
+
+## POST `/score/statement`
+
+Summarise a wallet or bank statement. Body: `{"csv": "<CSV text>"}` (up to
+2 MB). The CSV needs a date column and either an `amount` column (signed, or
+with a `type` column of CR / DR) or `credit` and `debit` columns; a `status`
+column is optional. Returns `full_months`, `months`, `transactions`,
+`monthly_inflow_median`, `monthly_net_median`, `inflow_variation`,
+`inflow_to_outflow`, the three `suggested_*` form values and `warnings`. The
+first and last months are left out when the statement starts after the 5th or
+ends before the 25th. `422` with the reason if fewer than 3 full months
+remain or the columns are not recognised. Nothing is stored.
+
+`POST /score` accepts the same text as `statement_csv`. The API re-reads it
+and stores the summary on the application as `turnover_evidence`, including
+`matches_statement`. It also accepts an optional `contact_phone`.
+
+## GET `/portfolio/reminders`
+
+Payment reminders for approved facilities, most urgent first. `kind` is
+`overdue`, `arrears` or `due_soon` (within 7 days). Each carries the
+installment number and amount, the due date, `days_until_due`, `arrears_pkr`,
+and `message_en` / `message_ur`. Facilities in Default are left out. The
+schedule runs monthly from the approval date. ForiFlow sends nothing.
+
+## GET `/portfolio/summary`
+
+The repayment position of every approved facility, read from the monthly
+observations recorded through `POST /ews/monitor`. Any signed-in officer.
+
+| Field | Meaning |
+| ----- | ------- |
+| `disbursed_pkr` | Sum of approved facility amounts. |
+| `due_pkr`, `collected_pkr`, `collection_rate` | Installments due and amounts paid in months where an amount was recorded; rate in percent, `null` when nothing is due. |
+| `overdue_pkr` | Per facility, due minus collected where positive. One facility paying ahead does not hide another's arrears. |
+| `outstanding_pkr` | Approved amounts not yet collected. |
+| `par30` | Outstanding on monitored facilities whose latest month is 30 or more days late, over outstanding on all monitored facilities, in percent. |
+| `defaulted_facilities`, `defaulted_outstanding_pkr` | Facilities whose latest month is `Default`. |
+| `months_with_amount`, `months_without_amount` | How many monthly records carry an amount paid. |
+| `latest_status` | Facilities and outstanding per repayment status of the latest month. |
+| `decision_matrix` | For each model band: how many ended Approved, Rejected or still pending. |
+| `sectors` | Per business sector: applications, approved, approval rate, approved exposure, average score, overdue, open alerts. |
+
+Installments are straight-line (facility / tenure); ForiFlow holds no interest
+rate. `POST /score` accepts an optional `business_sector` and `POST
+/ews/monitor` an optional `amount_paid_pkr`; neither is read by the model.
+
+## Path to approval
+
+For a Rejected or Manual Review outcome from the trained ensemble, the
+explanation carries `approval_path`:
 
 ```json
-{ "note": "Borrower paid the arrears on 12 Oct." }
+{
+  "requested_loan_pkr": 547920.0,
+  "monthly_turnover_pkr": 150000.0,
+  "steps": [
+    {"target_decision": "Manual Review", "max_loan_pkr": 547000.0, "score_at_max_loan": 49.57,
+     "required_monthly_turnover_pkr": 151000.0, "score_at_turnover": 50.23},
+    {"target_decision": "Approved", "max_loan_pkr": 177000.0, "score_at_max_loan": 70.11,
+     "required_monthly_turnover_pkr": 463000.0, "score_at_turnover": 70.08}
+  ],
+  "blocked_by": []
+}
 ```
 
-Closes an Active or In Review alert, recording `resolved_at`, `resolved_by`
-and `resolution_note` (5–1000 characters). `404` unknown id, `409` if already
-resolved, `403` for analysts, `422` without a note.
+`max_loan_pkr` is the largest facility, rounded down to PKR 1,000, at which
+the same applicant reaches the band; `required_monthly_turnover_pkr` is the
+smallest turnover, rounded up, at which the requested facility reaches it.
+Either is `null` when no value reaches the band, and `blocked_by` then names
+the factors holding it back. Both model members are monotone in facility size
+against turnover, so each threshold is unique. It is `null` for Approved
+outcomes, the surrogate engine and explanations stored before 1.5.0. These are
+model outputs, not an offer.
+
+## GET `/model/card` (2.2.0)
+
+What the Model page shows first: `serving_engine`, `serving_model_version`,
+`serving_artifact_sha256`; `status` (model version, training date, dataset
+identifier and type, dataset SHA-256, seed, split with row-id fingerprints,
+features, preprocessing); `performance` (final-test metrics raw and
+calibrated, CV on the training split, validation, and the pre-2.2 model's
+figures under `previous_model`); `evaluation_thresholds` (model evaluation
+thresholds) beside `policy_note` (the credit policy is separate);
+`baselines` and `baseline_cross_validation`; `calibration` (method, how it was
+chosen, Brier and ECE raw against calibrated, `display_only: true`); `shap`
+(including the model reference baseline); `data_quality`; `limitations`.
+Any signed-in officer.
+
+## GET `/model/data-quality` (2.2.0)
+
+The data-quality report of the training file (`ml/data_quality_report.json`):
+rows, columns, target balance, missing, duplicate and out-of-range values,
+distributions, excluded rows, preprocessing actions and the parameters
+learned on the training split. States that the file is public consumer
+credit data, not Pakistani SME banking data.
+
+## GET `/model/feature-contract` (2.2.0)
+
+For the engine scoring now: `model_features` (each with the intake fields it
+is built from), `used_intake_fields`, `collected_unused` (recorded, does not
+change the score), `identity_and_reporting_fields` and `future_sme_features`
+(data needs, not collected or used). The dashboard form marks unused fields
+from this.
+
+## GET `/model/evaluation`
+
+The served model on the **final test set**, measured once by `python -m
+ml.evaluate_model` (2.2 protocol: train 60% / validation 20% / final test 20%,
+seed 42; a second run for the same model is refused). Any signed-in officer.
+`404` if the script has not run.
+
+Returns `split`, `rows` and `default_rate` per set, `protocol`,
+`evaluation_thresholds` (raw probability 0.5; evaluation score bands 40 / 70,
+not the policy in force), `calibrator` (breakpoints, chosen and fitted on the
+validation split, display only), `validation`, `baselines` (each model's
+final-test metrics), `previous_model`, and under `final_test`: `metrics_raw`
+and `metrics_calibrated` (ROC-AUC, PR-AUC, precision, recall, F1, Brier,
+confusion), `raw` and `calibrated` (AUC, Brier, ECE, mean prediction),
+`brier_no_skill`, `roc_curve`, `confusion_at_half`, `thresholds`, `bands`,
+`reliability_raw`, `reliability_calibrated`. `holdout` is the pre-2.2 name for
+the same object. These describe the public training file, not the live
+portfolio.
+
+## GET `/model/early-warning`
+
+The early-warning Markov chain recorded by `python -m ml.ews_markov`: `states`,
+`transition_counts`, `transition_matrix`, `state_outlook` (default within 3 and
+12 months and expected days to default per state), `holdout_check`,
+`markov_assumption`, and `alternatives` (AUC and Brier of the served chain, a
+second-order chain, a logistic hazard model and gradient boosting, with a
+bootstrap interval of each AUC gap). Any signed-in officer.
+
+## GET `/model/drift`
+
+Population drift of the stored applications against the **reference / demo
+distribution** recorded by `ml.evaluate_model` (training-split inputs and
+validation-split scores of the public file, not a bank portfolio; this is not
+production drift monitoring). `reference_label` and `reference_note` say so. Per quantity (`risk_score` and each model
+input): `bins`, `reference_shares`, `live_shares`, `psi`, `noise_floor` (the
+PSI chance alone gives, about (bins - 1) / rows) and `verdict`: `stable`,
+`watch` (above 0.10), `shifted` (above 0.25), or `too few applications` below
+100 rows. The thresholds are an industry rule of thumb, not a statistical test.
+Any signed-in officer.
+
+## GET `/model/fairness`
+
+The **Subgroup Performance Analysis**, recorded by `python -m ml.evaluate_model`
+on the final test set. Per attribute (`Age`, `Income`, `Housing`, `Loan
+purpose`, none of which the model reads) and group: `rows`, `defaults`,
+`observed_default_rate`, `auc_roc`, `precision` and `recall` at the evaluation
+threshold, `predicted_default_rate` (calibrated), `sample_status`
+(`Sufficient` or `Insufficient sample size`: under 100 loans or under 10
+defaults or non-defaults, with no AUC reported), and the demo policy's
+approval and rejection shares. `interpretation` says the analysis is
+descriptive and does not establish fairness; `not_audited` lists what the file
+cannot show, including gender. Any signed-in officer.
+
+## GET `/model/comparison`
+
+The served ensemble against logistic regression, XGBoost alone and random
+forest alone, under the same split and train-only preprocessing: per model
+`cross_validation` (5 folds on the training split, with a paired t-test against
+the ensemble), `validation` and `final_test` metrics. Any signed-in officer.
+
+## Borrowers (1.10.0)
+
+A borrower is the business; it has many applications. `{ref}` is a `BRW-…`
+reference or the numeric id. Any signed-in officer unless noted.
+
+| Route | Purpose |
+|---|---|
+| `GET /borrowers?q=&limit=&offset=` | List, newest first. `q` matches business name, owner name or reference. An identifier is never searched by URL. Phone numbers are masked in the list (2.3). |
+| `POST /borrowers` | Open a borrower ahead of its first application. Identifier already on file: `409` naming the existing borrower. |
+| `GET /borrowers/{ref}` | One borrower. The identifier is returned masked. |
+| `PATCH /borrowers/{ref}` (manager or admin) | Correct name, owner, phone, sector, years, identifier or `status` (`active` / `inactive`). Only sent fields change. Applications keep what they were scored with. |
+| `GET /borrowers/{ref}/history` | Every application with score, band, officer decision, `model_version`, `scoring_engine`, monitored months and alerts, plus a summary. |
+
+```json
+{
+  "borrower": { "id": 4, "public_id": "BRW-000004", "business_name": "Khan Traders",
+                "identifier_type": null, "identifier_masked": null, "status": "active" },
+  "summary": { "applications": 2, "latest_score": 67.36, "lowest_score": 56.68,
+               "highest_score": 67.36, "approved_facilities": 1, "monitored_months": 3,
+               "open_alerts": 1, "total_alerts": 1,
+               "model_versions_used": ["ensemble-xgb-rf-credit_risk_shared-2026-09-25T10:38:26"],
+               "scoring_engines_used": ["ml"] },
+  "applications": [
+    { "application_id": 4, "risk_score": 56.68, "decision": "Manual Review",
+      "final_decision": "Approved", "model_version": "ensemble-xgb-rf-…",
+      "scoring_engine": "ml", "monitoring": [ "…3 months…" ], "alerts": [ "…1 alert…" ] }
+  ]
+}
+```
+
+`GET /ews/borrowers/{id}/history` is unchanged and different: its id is an
+**application** id and it returns that one facility's months. In every `/ews`
+route `borrower_id` still means the application.
+
+## GET `/model/versions`, `/model/versions/active` (1.10.0)
+
+Every model that has scored against this database, newest first, and the one
+scoring now. Per row: `version`, `engine`, `artifact_sha256`,
+`training_dataset`, `feature_set`, `feature_set_version`, `trained_at`,
+`metrics`, `status`, `is_active`, `fallback_reason`, `registered_at`,
+`applications_scored`. `/active` is `404` until a model has been registered.
+
+## GET `/audit/logs` (admin, 1.10.0)
+
+The append-only audit trail, newest first. Filters: `action`, `entity_type`,
+`entity_id`, `username`, `request_id`, `since`, `until`, `limit` (max 500),
+`offset`. There is no route that creates, changes or deletes an entry.
+
+```json
+{ "id": 7, "occurred_at": "2026-10-07T01:35:10Z", "user_id": 1, "username": "idreesi",
+  "role": "admin", "action": "application.scored", "entity_type": "application",
+  "entity_id": "14", "previous_state": null,
+  "new_state": { "risk_score": 67.36, "decision": "Manual Review" },
+  "details": { "model_version": "ensemble-xgb-rf-…", "scoring_engine": "ml",
+               "artifact_sha256": "…", "fallback_reason": null },
+  "ip_address": "127.0.0.1", "request_id": "b1dfe204…" }
+```
+
+Actions: `auth.login`, `auth.login_failed`, `user.created`, `borrower.created`,
+`borrower.updated`, `application.created`, `application.scored`,
+`explanation.generated`, `explanation.recomputed`,
+`application.officer_decision`, `application.approval_denied`,
+`ews.observation_created`, `ews.observation_updated`, `ews.alert_created`,
+`ews.alert_updated`, `ews.alert_auto_resolved`, `ews.alert_taken`,
+`ews.alert_resolved`, `model.registered`, `model.activated`,
+`migration.applied`.
+
+## Model, policy, human (2.0.0)
+
+Since 2.0.0 no score decides anything. Every application response carries
+three separate objects, and `decision_status` is `Pending` until an officer
+acts. Existing fields are unchanged in name and type.
+
+| Field | What it is |
+|---|---|
+| `assessment` | Model output: `risk_score`, `risk_band`, `probability_of_default_raw`, `probability_of_default` (calibrated), `model_version`, `scoring_engine` |
+| `policy` | Policy output: `recommendation`, `policy_id`, `policy_version`, `policy_name`, `triggered_rules`, `reason`, `authority` (`approve_requires`, `manager_approval_limit_pkr`, `reason`) |
+| `officer_decision` | Human output: `status`, `decision`, `decided_by`, `decided_at`, `note`, `source`, `overrides_recommendation`, escalation fields |
+| `recommendation` | `Approve`, `Manual Review` or `Decline` |
+| `decision` | The same recommendation in the pre-2.0 wording (`Approved`, `Manual Review`, `Rejected`). **Not a final decision.** Kept for compatibility |
+| `decision_status` | `Pending`, `Escalated`, `Approved`, `Rejected` or `Superseded` |
+| `final_decision` | `Approved` or `Rejected` once an officer has decided; `null` before |
+| `reason_codes` | Up to three coded risk factors derived from the SHAP contributions |
+
+**Behaviour change.** Before 2.0 an `Approved` or `Rejected` band was final and
+only `Manual Review` went to an officer. Now every application needs an officer
+decision, and only an approved one can be monitored by `/ews/monitor`.
+Applications from before 2.0 keep the outcome they had, marked
+`officer_decision.source = "legacy_auto"`.
+
+### POST `/score/applications/{id}/decision` (manager or admin)
+
+Records the human decision. `/score/applications/{id}/review` is the same
+handler under its pre-2.0 name.
+
+```json
+{ "decision": "Approved", "note": "Statement supports the stated turnover." }
+```
+
+`decision` is `Approved`, `Rejected` or `Escalated`; `note` is 10 to 1000
+characters. **`200`**: the application. **`403`**: the role may not take that
+action (above the manager limit, against a Decline recommendation, or the
+application is escalated); the refusal is audited. **`409`**: already decided,
+superseded, or an admin tried to escalate.
+
+### GET `/score/applications/{id}/decision-history`
+
+`assessments`: the application and every assessment it replaced or was replaced
+by, oldest first, each with its score, recommendation, model version, policy
+version and decision status. `events`: the audit entries on those applications
+(created, scored, recommendation generated, re-scored, escalated, refused,
+decided). `note` is set when part of the chain predates the audit trail.
+
+### Re-scoring
+
+`POST /score` with `rescore_of_application_id` re-assesses an undecided
+application. A new application is stored and returned with
+`supersedes_application_id`; the earlier one is kept and marked `Superseded`.
+`409` if the earlier one is already decided or superseded.
+
+### GET `/score/applications` filters
+
+`decision_status=` any status. `pending_review=true` now means Pending or
+Escalated, whatever the recommendation. `final_decision=` is the officer's
+decision. `/score/stats` leaves superseded assessments out of its totals and
+reports them as `superseded_assessments`.
+
+## Credit policy (2.0.0)
+
+| Route | Purpose |
+|---|---|
+| `GET /policy/active` | The version in force. Any officer |
+| `GET /policy/versions` | Every version, newest first, with `applications_assessed`. Any officer |
+| `POST /policy/versions` (admin) | Create a version as a draft. A version number cannot be reused (`409`) |
+| `POST /policy/versions/{id}/activate` (admin) | Make it active and retire the previous one |
+
+```json
+{ "version": "1.1", "name": "Pilot Credit Policy", "decline_max_score": 45,
+  "manual_review_max_score": 75, "manager_approval_limit_pkr": 1500000,
+  "decline_override_admin_only": true }
+```
+
+There is no route that edits or deletes a version. The shipped version 1.0 is
+a demo policy (40 / 70 / PKR 2,000,000); its cut-offs are not validated for
+Pakistani SME lending.
+
+New audit actions: `recommendation.generated`, `application.escalated`,
+`application.rescored`, `application.superseded`, `policy.created`,
+`policy.activated`, `policy.retired`.
+
+## Policy bands for drawing (2.0.1)
+
+Every application's `policy` object carries `bands`:
+
+```json
+"bands": { "decline_max_score": 45.0, "manual_review_max_score": 74.0,
+           "approve_above_score": 74.0, "source": "policy_snapshot" }
+```
+
+`source` is `policy_snapshot` (stored at scoring time) or `legacy_fixed_rule`
+(scored before 2.0, when the code used fixed 40 / 70). Draw an application with
+its own `bands`, never with today's policy. `/score/stats` returns
+`histogram_policy_version`, `histogram_bands` (`source: active_policy`) and,
+per bar, `risk_band` and `recommendation`: the bars are cut on the active
+policy, two per band. The recommendation shown for an application is always
+the API's `recommendation`; bands are for drawing only.
